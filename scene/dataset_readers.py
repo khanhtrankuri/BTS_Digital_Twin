@@ -238,14 +238,11 @@ def readPhase1TestCameras(path, is_test=True):
         for idx, row in enumerate(reader):
             image_name = row["image_name"]
             image_path = os.path.join(images_folder, image_name)
-            if not os.path.exists(image_path):
-                continue
 
             qvec = np.array([float(row["qw"]), float(row["qx"]), float(row["qy"]), float(row["qz"])])
-            camera_center = np.array([float(row["tx"]), float(row["ty"]), float(row["tz"])])
             w2c_rotation = qvec2rotmat(qvec)
             R = np.transpose(w2c_rotation)
-            T = -w2c_rotation @ camera_center
+            T = np.array([float(row["tx"]), float(row["ty"]), float(row["tz"])])
 
             width = int(float(row["width"]))
             height = int(float(row["height"]))

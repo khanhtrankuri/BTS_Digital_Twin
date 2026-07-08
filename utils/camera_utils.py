@@ -11,6 +11,7 @@
 
 from scene.cameras import Camera
 import numpy as np
+import os
 from utils.graphics_utils import fov2focal
 from PIL import Image
 import cv2
@@ -18,7 +19,11 @@ import cv2
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
-    image = Image.open(cam_info.image_path)
+    has_ground_truth = bool(cam_info.image_path) and cam_info.image_path != "" and os.path.exists(cam_info.image_path)
+    if has_ground_truth:
+        image = Image.open(cam_info.image_path)
+    else:
+        image = Image.new("RGB", (cam_info.width, cam_info.height))
 
     if cam_info.depth_path != "":
         try:
@@ -64,7 +69,8 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
                   image=image, invdepthmap=invdepthmap,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
-                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
+                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
+                  has_ground_truth=has_ground_truth)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
     camera_list = []
