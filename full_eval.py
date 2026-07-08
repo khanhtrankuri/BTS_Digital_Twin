@@ -10,6 +10,8 @@
 #
 
 import os
+import subprocess
+import sys
 from argparse import ArgumentParser
 import time
 
@@ -18,95 +20,113 @@ mipnerf360_indoor_scenes = ["room", "counter", "kitchen", "bonsai"]
 tanks_and_temples_scenes = ["truck", "train"]
 deep_blending_scenes = ["drjohnson", "playroom"]
 
-parser = ArgumentParser(description="Full evaluation script parameters")
-parser.add_argument("--skip_training", action="store_true")
-parser.add_argument("--skip_rendering", action="store_true")
-parser.add_argument("--skip_metrics", action="store_true")
-parser.add_argument("--output_path", default="./eval")
-parser.add_argument("--use_depth", action="store_true")
-parser.add_argument("--use_expcomp", action="store_true")
-parser.add_argument("--fast", action="store_true")
-parser.add_argument("--aa", action="store_true")
+def run_command(args):
+    subprocess.run(args, check=True)
 
 
+def build_parser():
+    parser = ArgumentParser(description="Full evaluation script parameters")
+    parser.add_argument("--skip_training", action="store_true")
+    parser.add_argument("--skip_rendering", action="store_true")
+    parser.add_argument("--skip_metrics", action="store_true")
+    parser.add_argument("--output_path", default="./eval")
+    parser.add_argument("--use_depth", action="store_true")
+    parser.add_argument("--use_expcomp", action="store_true")
+    parser.add_argument("--fast", action="store_true")
+    parser.add_argument("--aa", action="store_true")
+    return parser
 
 
-args, _ = parser.parse_known_args()
+def main():
+    parser = build_parser()
+    args, _ = parser.parse_known_args()
 
-all_scenes = []
-all_scenes.extend(mipnerf360_outdoor_scenes)
-all_scenes.extend(mipnerf360_indoor_scenes)
-all_scenes.extend(tanks_and_temples_scenes)
-all_scenes.extend(deep_blending_scenes)
+    if not args.skip_training or not args.skip_rendering:
+        parser.add_argument('--mipnerf360', "-m360", required=True, type=str)
+        parser.add_argument("--tanksandtemples", "-tat", required=True, type=str)
+        parser.add_argument("--deepblending", "-db", required=True, type=str)
+        args = parser.parse_args()
 
-if not args.skip_training or not args.skip_rendering:
-    parser.add_argument('--mipnerf360', "-m360", required=True, type=str)
-    parser.add_argument("--tanksandtemples", "-tat", required=True, type=str)
-    parser.add_argument("--deepblending", "-db", required=True, type=str)
-    args = parser.parse_args()
-if not args.skip_training:
-    common_args = " --disable_viewer --quiet --eval --test_iterations -1 "
-    
-    if args.aa:
-        common_args += " --antialiasing "
-    if args.use_depth:
-        common_args += " -d depths2/ "
+    all_scenes = []
+    all_scenes.extend(mipnerf360_outdoor_scenes)
+    all_scenes.extend(mipnerf360_indoor_scenes)
+    all_scenes.extend(tanks_and_temples_scenes)
+    all_scenes.extend(deep_blending_scenes)
 
-    if args.use_expcomp:
-        common_args += " --exposure_lr_init 0.001 --exposure_lr_final 0.0001 --exposure_lr_delay_steps 5000 --exposure_lr_delay_mult 0.001 --train_test_exp "
+    if not args.skip_training:
+        os.makedirs(args.output_path, exist_ok=True)
+        common_args = ["--disable_viewer", "--quiet", "--eval", "--test_iterations", "-1"]
 
-    if args.fast:
-        common_args += " --optimizer_type sparse_adam "
+        if args.aa:
+            common_args.append("--antialiasing")
+        if args.use_depth:
+            common_args.extend(["-d", "depths2/"])
+        if args.use_expcomp:
+            common_args.extend([
+                "--exposure_lr_init", "0.001",
+                "--exposure_lr_final", "0.0001",
+                "--exposure_lr_delay_steps", "5000",
+                "--exposure_lr_delay_mult", "0.001",
+                "--train_test_exp",
+            ])
+        if args.fast:
+            common_args.extend(["--optimizer_type", "sparse_adam"])
 
-    start_time = time.time()
-    for scene in mipnerf360_outdoor_scenes:
-        source = args.mipnerf360 + "/" + scene
-        os.system("python train.py -s " + source + " -i images_4 -m " + args.output_path + "/" + scene + common_args)
-    for scene in mipnerf360_indoor_scenes:
-        source = args.mipnerf360 + "/" + scene
-        os.system("python train.py -s " + source + " -i images_2 -m " + args.output_path + "/" + scene + common_args)
-    m360_timing = (time.time() - start_time)/60.0
+        start_time = time.time()
+        for scene in mipnerf360_outdoor_scenes:
+            source = os.path.join(args.mipnerf360, scene)
+            model = os.path.join(args.output_path, scene)
+            run_command([sys.executable, "train.py", "-s", source, "-i", "images_4", "-m", model, *common_args])
+        for scene in mipnerf360_indoor_scenes:
+            source = os.path.join(args.mipnerf360, scene)
+            model = os.path.join(args.output_path, scene)
+            run_command([sys.executable, "train.py", "-s", source, "-i", "images_2", "-m", model, *common_args])
+        m360_timing = (time.time() - start_time) / 60.0
 
-    start_time = time.time()
-    for scene in tanks_and_temples_scenes:
-        source = args.tanksandtemples + "/" + scene
-        os.system("python train.py -s " + source + " -m " + args.output_path + "/" + scene + common_args)
-    tandt_timing = (time.time() - start_time)/60.0
+        start_time = time.time()
+        for scene in tanks_and_temples_scenes:
+            source = os.path.join(args.tanksandtemples, scene)
+            model = os.path.join(args.output_path, scene)
+            run_command([sys.executable, "train.py", "-s", source, "-m", model, *common_args])
+        tandt_timing = (time.time() - start_time) / 60.0
 
-    start_time = time.time()
-    for scene in deep_blending_scenes:
-        source = args.deepblending + "/" + scene
-        os.system("python train.py -s " + source + " -m " + args.output_path + "/" + scene + common_args)
-    db_timing = (time.time() - start_time)/60.0
+        start_time = time.time()
+        for scene in deep_blending_scenes:
+            source = os.path.join(args.deepblending, scene)
+            model = os.path.join(args.output_path, scene)
+            run_command([sys.executable, "train.py", "-s", source, "-m", model, *common_args])
+        db_timing = (time.time() - start_time) / 60.0
 
-with open(os.path.join(args.output_path,"timing.txt"), 'w') as file:
-    file.write(f"m360: {m360_timing} minutes \n tandt: {tandt_timing} minutes \n db: {db_timing} minutes\n")
+        with open(os.path.join(args.output_path, "timing.txt"), 'w') as file:
+            file.write(f"m360: {m360_timing} minutes \n tandt: {tandt_timing} minutes \n db: {db_timing} minutes\n")
 
-if not args.skip_rendering:
-    all_sources = []
-    for scene in mipnerf360_outdoor_scenes:
-        all_sources.append(args.mipnerf360 + "/" + scene)
-    for scene in mipnerf360_indoor_scenes:
-        all_sources.append(args.mipnerf360 + "/" + scene)
-    for scene in tanks_and_temples_scenes:
-        all_sources.append(args.tanksandtemples + "/" + scene)
-    for scene in deep_blending_scenes:
-        all_sources.append(args.deepblending + "/" + scene)
-    
-    common_args = " --quiet --eval --skip_train"
-    
-    if args.aa:
-        common_args += " --antialiasing "
-    if args.use_expcomp:
-        common_args += " --train_test_exp "
+    if not args.skip_rendering:
+        all_sources = []
+        for scene in mipnerf360_outdoor_scenes:
+            all_sources.append(os.path.join(args.mipnerf360, scene))
+        for scene in mipnerf360_indoor_scenes:
+            all_sources.append(os.path.join(args.mipnerf360, scene))
+        for scene in tanks_and_temples_scenes:
+            all_sources.append(os.path.join(args.tanksandtemples, scene))
+        for scene in deep_blending_scenes:
+            all_sources.append(os.path.join(args.deepblending, scene))
 
-    for scene, source in zip(all_scenes, all_sources):
-        os.system("python render.py --iteration 7000 -s " + source + " -m " + args.output_path + "/" + scene + common_args)
-        os.system("python render.py --iteration 30000 -s " + source + " -m " + args.output_path + "/" + scene + common_args)
+        common_args = ["--quiet", "--eval", "--skip_train"]
 
-if not args.skip_metrics:
-    scenes_string = ""
-    for scene in all_scenes:
-        scenes_string += "\"" + args.output_path + "/" + scene + "\" "
+        if args.aa:
+            common_args.append("--antialiasing")
+        if args.use_expcomp:
+            common_args.append("--train_test_exp")
 
-    os.system("python metrics.py -m " + scenes_string)
+        for scene, source in zip(all_scenes, all_sources):
+            model = os.path.join(args.output_path, scene)
+            run_command([sys.executable, "render.py", "--iteration", "7000", "-s", source, "-m", model, *common_args])
+            run_command([sys.executable, "render.py", "--iteration", "30000", "-s", source, "-m", model, *common_args])
+
+    if not args.skip_metrics:
+        model_paths = [os.path.join(args.output_path, scene) for scene in all_scenes]
+        run_command([sys.executable, "metrics.py", "-m", *model_paths])
+
+
+if __name__ == "__main__":
+    main()

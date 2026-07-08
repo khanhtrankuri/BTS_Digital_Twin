@@ -11,6 +11,7 @@
 
 import os
 import sys
+import csv
 from PIL import Image
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -85,17 +86,17 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model=="SIMPLE_PINHOLE":
+        if intr.model in ["SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"]:
             focal_length_x = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
-        elif intr.model=="PINHOLE":
+        elif intr.model in ["PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV"]:
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         else:
-            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+            assert False, f"Colmap camera model not handled: {intr.model}"
 
         n_remove = len(extr.name.split('.')[-1]) + 1
         depth_params = None
@@ -106,6 +107,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
                 print("\n", key, "not found in depths_params")
 
         image_path = os.path.join(images_folder, extr.name)
+        if not os.path.exists(image_path):
+            continue
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
 
@@ -225,6 +228,49 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
                            is_nerf_synthetic=False)
     return scene_info
 
+def readPhase1TestCameras(path, is_test=True):
+    test_csv = os.path.join(path, "test", "test_poses.csv")
+    images_folder = os.path.join(path, "test", "images")
+    cam_infos = []
+
+    with open(test_csv, "r", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        for idx, row in enumerate(reader):
+            image_name = row["image_name"]
+            image_path = os.path.join(images_folder, image_name)
+            if not os.path.exists(image_path):
+                continue
+
+            qvec = np.array([float(row["qw"]), float(row["qx"]), float(row["qy"]), float(row["qz"])])
+            camera_center = np.array([float(row["tx"]), float(row["ty"]), float(row["tz"])])
+            w2c_rotation = qvec2rotmat(qvec)
+            R = np.transpose(w2c_rotation)
+            T = -w2c_rotation @ camera_center
+
+            width = int(float(row["width"]))
+            height = int(float(row["height"]))
+            focal_length_x = float(row["fx"])
+            focal_length_y = float(row["fy"])
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=None,
+                                        image_path=image_path, image_name=image_name, depth_path="",
+                                        width=width, height=height, is_test=is_test))
+    return cam_infos
+
+def readPhase1SceneInfo(path, images, depths, eval, train_test_exp):
+    train_path = os.path.join(path, "train")
+    scene_info = readColmapSceneInfo(train_path, images, depths, False, train_test_exp)
+    test_cameras = readPhase1TestCameras(path) if eval else []
+
+    return SceneInfo(point_cloud=scene_info.point_cloud,
+                     train_cameras=scene_info.train_cameras,
+                     test_cameras=test_cameras,
+                     nerf_normalization=scene_info.nerf_normalization,
+                     ply_path=scene_info.ply_path,
+                     is_nerf_synthetic=scene_info.is_nerf_synthetic)
+
 def readCamerasFromTransforms(path, transformsfile, depths_folder, white_background, is_test, extension=".png"):
     cam_infos = []
 
@@ -311,5 +357,6 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
+    "Phase1": readPhase1SceneInfo,
     "Blender" : readNerfSyntheticInfo
 }

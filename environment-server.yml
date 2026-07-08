@@ -4,8 +4,8 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  # Tested on Windows with RTX 4060, NVIDIA driver CUDA 13.1, and PyTorch CUDA 12.8.
-  # On Windows, install Visual Studio 2022 Build Tools with the C++ workload first.
+  # Linux/server environment for Gaussian Splatting.
+  # The server should already have a recent NVIDIA driver plus gcc/g++ installed.
   - python=3.12
   - pip
   - setuptools
@@ -15,7 +15,6 @@ dependencies:
   - cmake
   - ninja
   - cuda-nvcc=12.8
-  - vs2022_win-64
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu128
       - torch==2.7.1+cu128
@@ -27,7 +26,7 @@ dependencies:
 # After creating the env from this file, build the local CUDA extensions from
 # the repository root:
 #
-#   conda env create -f environment.yml
+#   conda env create -f environment-server.yml
 #   conda activate BTS
 #   python -m pip install --no-build-isolation submodules/diff-gaussian-rasterization submodules/simple-knn submodules/fused-ssim
 #
