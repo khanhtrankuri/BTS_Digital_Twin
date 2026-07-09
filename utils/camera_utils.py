@@ -69,6 +69,8 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
                   image=image, invdepthmap=invdepthmap,
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  cx=getattr(cam_info, "cx", None), cy=getattr(cam_info, "cy", None),
+                  source_width=cam_info.width, source_height=cam_info.height,
                   train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test,
                   has_ground_truth=has_ground_truth)
 
@@ -97,7 +99,9 @@ def camera_to_JSON(id, camera : Camera):
         'height' : camera.height,
         'position': pos.tolist(),
         'rotation': serializable_array_2d,
-        'fy' : fov2focal(camera.FovY, camera.height),
-        'fx' : fov2focal(camera.FovX, camera.width)
+        'fy' : fov2focal(camera.FoVy, camera.height),
+        'fx' : fov2focal(camera.FoVx, camera.width),
+        'cx' : camera.cx if camera.cx is not None else camera.width / 2.0,
+        'cy' : camera.cy if camera.cy is not None else camera.height / 2.0
     }
     return camera_entry

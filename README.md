@@ -615,3 +615,77 @@ pip install submodules\simple-knn
 - *Wait, but ```<insert feature>``` isn't optimized and could be much better?* There are several parts we didn't even have time to think about improving (yet). The performance you get with this prototype is probably a rather slow baseline for what is physically possible.
 
 - *Something is broken, how did this happen?* We tried hard to provide a solid and comprehensible basis to make use of the paper's method. We have refactored the code quite a bit, but we have limited capacity to test all possible usage scenarios. Thus, if part of the website, the code or the performance is lacking, please create an issue. If we find the time, we will do our best to address it.
+
+## BTS Digital Twin Phase1 Kaggle workflow
+
+This fork supports the Phase1 layout where each scene contains `train/images`, `train/sparse/0`, and `test/test_poses.csv`. Public scenes may also contain `test/images` for metrics; private scenes can be rendered without ground truth.
+
+Install optional LPIPS metrics:
+```bash
+pip install lpips
+```
+
+Train all scenes in `public_set` with one process per GPU:
+```bash
+python train_multi_cuda.py \
+  -s /kaggle/working/bts-dataset/phase1/public_set \
+  --gpus 0,1 \
+  --output_root output/multigpu_public \
+  -- --iterations 30000 --eval \
+     --resolution 2 \
+     --densify_until_iter 8000 \
+     --densification_interval 200 \
+     --densify_grad_threshold 0.0004 \
+     --test_iterations 7000 15000 30000 \
+     --save_iterations 30000 \
+     --psnr_max 30
+```
+
+Evaluate `public_set`:
+```bash
+python evaluate_public.py \
+  --data_root /kaggle/working/bts-dataset/phase1/public_set \
+  --model_root output/multigpu_public \
+  --iteration 30000 \
+  --psnr_max 30 \
+  --csv_path metrics_public.csv
+```
+
+Train all scenes in `private_set1`:
+```bash
+python train_multi_cuda.py \
+  -s /kaggle/working/bts-dataset/phase1/private_set1 \
+  --gpus 0,1 \
+  --output_root output/multigpu_private \
+  -- --iterations 30000 \
+     --resolution 2 \
+     --densify_until_iter 8000 \
+     --densification_interval 200 \
+     --densify_grad_threshold 0.0004 \
+     --save_iterations 30000
+```
+
+Render the private submission at the exact CSV resolution and zip it:
+```bash
+python render_submission.py \
+  --data_root /kaggle/working/bts-dataset/phase1/private_set1 \
+  --model_root output/multigpu_private \
+  --iteration 30000 \
+  --resolution 1 \
+  --output_dir submission \
+  --zip_path submission.zip
+```
+
+`train_multi_cuda.py -s` accepts either a single scene path or a parent folder such as `public_set` or `private_set1`. When a parent folder is passed, it discovers direct child scenes and writes models to `--output_root/<scene_name>` unless explicit `--model_paths` are provided.
+
+Recommended public-set experiment grid:
+
+| Config | Arguments |
+| --- | --- |
+| baseline | `--resolution 2 --densify_until_iter 8000 --densification_interval 200 --densify_grad_threshold 0.0004` |
+| more_detail | `--resolution 2 --densify_until_iter 12000 --densification_interval 100 --densify_grad_threshold 0.0002` |
+| less_overfit | `--resolution 2 --densify_until_iter 6000 --densification_interval 300 --densify_grad_threshold 0.0006` |
+| high_quality | `--resolution 1 --densify_until_iter 12000 --densification_interval 100 --densify_grad_threshold 0.0002` |
+| memory_safe | `--resolution 4 --densify_until_iter 8000 --densification_interval 200 --densify_grad_threshold 0.0004` |
+
+For each config, train `public_set`, write a separate `metrics_public_<config>.csv`, compare mean `score`, then train `private_set1` with the best public config. The score is `0.4 * (1 - LPIPS) + 0.3 * SSIM + 0.3 * PSNR_norm`, with `PSNR_norm = clamp(PSNR / psnr_max, 0, 1)`.

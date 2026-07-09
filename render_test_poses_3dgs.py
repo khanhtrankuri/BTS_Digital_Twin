@@ -1,4 +1,4 @@
-"""
+r"""
 Render test poses from `test_poses.csv` for original-style 3D Gaussian Splatting repos.
 
 Put this file inside the root of your gaussian-splatting repo, next to `train.py`.
@@ -18,6 +18,7 @@ import csv
 import numpy as np
 import torch
 import torchvision
+from PIL import Image
 
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import render
@@ -61,6 +62,8 @@ def make_camera_from_csv_row(row, uid, data_device="cuda"):
 
     fx = row_to_float(row, "fx")
     fy = row_to_float(row, "fy")
+    cx = row_to_float(row, "cx")
+    cy = row_to_float(row, "cy")
 
     qw = row_to_float(row, "qw")
     qx = row_to_float(row, "qx")
@@ -83,21 +86,28 @@ def make_camera_from_csv_row(row, uid, data_device="cuda"):
     FoVx = focal2fov(fx, width)
     FoVy = focal2fov(fy, height)
 
-    # Camera class in original 3DGS requires an image tensor
-    # to know width/height. For test camera, use a dummy black tensor.
-    dummy_image = torch.zeros((3, height, width), dtype=torch.float32, device=data_device)
+    # Camera class requires an image to know width/height. For test camera,
+    # use a dummy black PIL image and keep the CSV intrinsics.
+    dummy_image = Image.new("RGB", (width, height))
 
     cam = Camera(
+        resolution=(width, height),
         colmap_id=uid,
         R=R_for_3dgs,
         T=T_w2c,
         FoVx=FoVx,
         FoVy=FoVy,
+        depth_params=None,
         image=dummy_image,
-        gt_alpha_mask=None,
+        invdepthmap=None,
         image_name=image_name,
         uid=uid,
+        cx=cx,
+        cy=cy,
+        source_width=width,
+        source_height=height,
         data_device=data_device,
+        has_ground_truth=False,
     )
     return cam
 

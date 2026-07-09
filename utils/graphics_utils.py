@@ -48,7 +48,20 @@ def getWorld2View2(R, t, translate=np.array([.0, .0, .0]), scale=1.0):
     Rt = np.linalg.inv(C2W)
     return np.float32(Rt)
 
-def getProjectionMatrix(znear, zfar, fovX, fovY):
+def getProjectionMatrix(znear, zfar, fovX, fovY, fx=None, fy=None, cx=None, cy=None, width=None, height=None):
+    if all(value is not None for value in (fx, fy, cx, cy, width, height)):
+        P = torch.zeros(4, 4)
+        z_sign = 1.0
+
+        P[0, 0] = 2.0 * fx / width
+        P[1, 1] = 2.0 * fy / height
+        P[0, 2] = 2.0 * cx / width - 1.0
+        P[1, 2] = 2.0 * cy / height - 1.0
+        P[3, 2] = z_sign
+        P[2, 2] = z_sign * zfar / (zfar - znear)
+        P[2, 3] = -(zfar * znear) / (zfar - znear)
+        return P
+
     tanHalfFovY = math.tan((fovY / 2))
     tanHalfFovX = math.tan((fovX / 2))
 

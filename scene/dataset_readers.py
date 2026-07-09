@@ -30,6 +30,8 @@ class CameraInfo(NamedTuple):
     T: np.array
     FovY: np.array
     FovX: np.array
+    cx: float
+    cy: float
     depth_params: dict
     image_path: str
     image_name: str
@@ -88,11 +90,15 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         if intr.model in ["SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"]:
             focal_length_x = intr.params[0]
+            cx = intr.params[1]
+            cy = intr.params[2]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
         elif intr.model in ["PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV"]:
             focal_length_x = intr.params[0]
             focal_length_y = intr.params[1]
+            cx = intr.params[2]
+            cy = intr.params[3]
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
         else:
@@ -112,7 +118,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         image_name = extr.name
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, cx=cx, cy=cy, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
                               width=width, height=height, is_test=image_name in test_cam_names_list)
         cam_infos.append(cam_info)
@@ -248,10 +254,12 @@ def readPhase1TestCameras(path, is_test=True):
             height = int(float(row["height"]))
             focal_length_x = float(row["fx"])
             focal_length_y = float(row["fy"])
+            cx = float(row["cx"]) if row.get("cx") not in (None, "") else width / 2.0
+            cy = float(row["cy"]) if row.get("cy") not in (None, "") else height / 2.0
             FovY = focal2fov(focal_length_y, height)
             FovX = focal2fov(focal_length_x, width)
 
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=None,
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, cx=cx, cy=cy, depth_params=None,
                                         image_path=image_path, image_name=image_name, depth_path="",
                                         width=width, height=height, is_test=is_test))
     return cam_infos
@@ -308,6 +316,7 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
+                            cx=image.size[0] / 2.0, cy=image.size[1] / 2.0,
                             image_path=image_path, image_name=image_name,
                             width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
             

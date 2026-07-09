@@ -27,19 +27,21 @@ def is_scene_dir(path):
 
 def discover_scenes(data_root):
     root = Path(data_root)
+    if not root.exists():
+        raise SystemExit(f"Data root does not exist: {data_root}")
     if is_scene_dir(root):
         return [root]
     return sorted([path for path in root.iterdir() if path.is_dir() and is_scene_dir(path)])
 
 
-def make_dataset_args(source_path, model_path):
+def make_dataset_args(source_path, model_path, resolution):
     return Namespace(
         sh_degree=3,
         source_path=str(source_path.resolve()),
         model_path=str(model_path),
         images="images",
         depths="",
-        resolution=-1,
+        resolution=resolution,
         white_background=False,
         train_test_exp=False,
         data_device="cuda",
@@ -56,8 +58,8 @@ def make_pipeline_args():
     )
 
 
-def render_scene(scene_path, model_path, iteration, output_dir):
-    dataset = make_dataset_args(scene_path, model_path)
+def render_scene(scene_path, model_path, iteration, resolution, output_dir):
+    dataset = make_dataset_args(scene_path, model_path, resolution)
     pipeline = make_pipeline_args()
     scene_output = Path(output_dir) / scene_path.name
     scene_output.mkdir(parents=True, exist_ok=True)
@@ -99,6 +101,7 @@ def main():
     parser.add_argument("--data_root", required=True)
     parser.add_argument("--model_root", required=True)
     parser.add_argument("--iteration", type=int, default=30000)
+    parser.add_argument("--resolution", type=int, default=1)
     parser.add_argument("--output_dir", default="submission")
     parser.add_argument("--zip_path", default="submission.zip")
     parser.add_argument("--quiet", action="store_true")
@@ -114,7 +117,7 @@ def main():
         if not model_path.exists():
             print(f"Skip {scene_path.name}: model folder not found at {model_path}")
             continue
-        render_scene(scene_path, model_path, args.iteration, args.output_dir)
+        render_scene(scene_path, model_path, args.iteration, args.resolution, args.output_dir)
 
     zip_submission(args.output_dir, args.zip_path)
     print(f"Saved submission zip to {args.zip_path}")

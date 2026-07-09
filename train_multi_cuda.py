@@ -28,6 +28,48 @@ def default_model_path(source_path, output_root):
     return str(Path(output_root) / name)
 
 
+def is_scene_dir(path: Path):
+    if (path / "train" / "sparse").exists() and (path / "test" / "test_poses.csv").exists():
+        return True
+    if (path / "sparse").exists():
+        return True
+    if (path / "transforms_train.json").exists():
+        return True
+    return False
+
+
+def discover_scene_dirs(source_paths):
+    discovered = []
+    seen = set()
+
+    for source_path in source_paths:
+        path = Path(source_path).expanduser()
+        if not path.exists():
+            raise SystemExit(f"Source path does not exist: {source_path}")
+
+        path = path.resolve()
+        candidates = []
+        if is_scene_dir(path):
+            candidates.append(path)
+        elif path.is_dir():
+            candidates.extend(
+                child.resolve()
+                for child in sorted(path.iterdir())
+                if child.is_dir() and is_scene_dir(child)
+            )
+
+        if not candidates:
+            raise SystemExit(f"No supported scenes found under: {path}")
+
+        for candidate in candidates:
+            candidate_key = str(candidate)
+            if candidate_key not in seen:
+                discovered.append(candidate)
+                seen.add(candidate_key)
+
+    return discovered
+
+
 def build_train_command(args, source_path, model_path, gpu_index, job_index):
     cmd = [
         args.python,
@@ -151,15 +193,25 @@ def main():
     if args.train_args and args.train_args[0] == "--":
         args.train_args = args.train_args[1:]
 
+    args.source_paths = discover_scene_dirs(args.source_paths)
+
+    print("Discovered scenes:", flush=True)
+    for scene_path in args.source_paths:
+        print(f"  {scene_path}", flush=True)
+
     gpus = parse_csv(args.gpus)
     if not gpus:
         raise SystemExit("No GPUs were provided. Example: --gpus 0,1")
 
     if args.model_paths is not None and len(args.model_paths) != len(args.source_paths):
-        raise SystemExit("-m/--model_paths must have the same length as -s/--source_paths.")
+        raise SystemExit(
+            "--model_paths must have the same length as discovered scenes. "
+            f"Got {len(args.model_paths)} model paths for {len(args.source_paths)} scenes."
+        )
 
     job_defs = []
     for job_index, source_path in enumerate(args.source_paths):
+        source_path = str(source_path)
         model_path = (
             args.model_paths[job_index]
             if args.model_paths is not None
