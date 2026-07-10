@@ -1,0 +1,4 @@
+# Original 3D Gaussian Splatting behaviour; all BTS-GeoGS paths stay disabled.
+MODEL:
+  GEOMETRY_AWARE:
+    ENABLED: false

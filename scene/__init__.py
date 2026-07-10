@@ -22,7 +22,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], optimization_args=None):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -83,7 +83,19 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"), args.train_test_exp)
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
+            if optimization_args is not None and optimization_args.initialization_mode == "dense_prior":
+                from utils.dense_initialization import load_dense_initialization, voxel_downsample
+                if not optimization_args.dense_prior_path:
+                    raise ValueError("--dense_prior_path is required when --initialization_mode dense_prior is selected.")
+                dense_data = load_dense_initialization(optimization_args.dense_prior_path)
+                confidence = dense_data.get("confidence")
+                if confidence is not None:
+                    keep = confidence >= float(optimization_args.dense_prior_confidence_threshold)
+                    dense_data = {key: value[keep] if value is not None else None for key, value in dense_data.items()}
+                dense_data = voxel_downsample(dense_data, optimization_args.dense_prior_voxel_size)
+                self.gaussians.create_from_dense_prior(dense_data, scene_info.train_cameras, self.cameras_extent, optimization_args)
+            else:
+                self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))

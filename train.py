@@ -13,6 +13,13 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
+from utils.geometry_losses import (
+    edge_weighted_l1_loss,
+    gaussian_scale_regularization,
+    get_loss_weights,
+    normal_consistency_loss,
+    scale_shift_invariant_depth_loss,
+)
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -28,7 +35,7 @@ from utils.eval_utils import (
     write_tensorboard_metrics,
 )
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
+from arguments import ModelParams, PipelineParams, OptimizationParams, load_bts_geogs_config
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -55,7 +62,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians, optimization_args=opt)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
@@ -69,6 +76,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
+    if opt.geometry_aware:
+        if opt.depth_loss_enabled and not any(cam.depth_prior is not None for cam in scene.getTrainCameras()):
+            print("[BTS-GeoGS] Depth loss requested but no depth prior was loaded; skipping it.")
+        if opt.normal_loss_enabled and not any(cam.normal_prior is not None for cam in scene.getTrainCameras()):
+            print("[BTS-GeoGS] Normal loss requested but no normal prior was loaded; skipping it.")
 
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
@@ -115,7 +127,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
+                            separate_sh=SPARSE_ADAM_AVAILABLE, render_geometry=opt.geometry_aware)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -131,11 +144,38 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        loss_terms = {"rgb": Ll1, "l1": Ll1, "ssim": 1.0 - ssim_value}
+        geometry_weights = get_loss_weights(iteration, opt)
+        confidence = viewpoint_cam.confidence_map
+        if confidence is not None and opt.depth_confidence_weighted:
+            confidence = torch.where(confidence >= opt.depth_min_confidence, confidence, torch.zeros_like(confidence))
+        alpha_valid = render_pkg["alpha"] > 1e-6 if render_pkg["alpha"] is not None else None
+        if geometry_weights["depth"] and viewpoint_cam.depth_prior is not None:
+            depth_loss = scale_shift_invariant_depth_loss(render_pkg["depth"], viewpoint_cam.depth_prior,
+                                                          confidence=confidence, valid_mask=alpha_valid)
+            loss += geometry_weights["depth"] * depth_loss
+            loss_terms["depth"] = depth_loss
+        if geometry_weights["normal"] and viewpoint_cam.normal_prior is not None:
+            normal_loss = normal_consistency_loss(render_pkg["normal"], viewpoint_cam.normal_prior,
+                                                   confidence=confidence, valid_mask=alpha_valid,
+                                                   use_abs_cosine=opt.normal_use_abs_cosine)
+            loss += geometry_weights["normal"] * normal_loss
+            loss_terms["normal"] = normal_loss
+        edge_map = viewpoint_cam.edge_map
+        if edge_map is not None and geometry_weights["edge"]:
+            edge_loss = edge_weighted_l1_loss(image, gt_image, edge_map, opt.edge_weight_gamma)
+            loss += geometry_weights["edge"] * edge_loss
+            loss_terms["edge"] = edge_loss
+        if geometry_weights["scale"]:
+            scale_loss = gaussian_scale_regularization(gaussians.get_scaling, opt.max_gaussian_scale,
+                                                       opt.max_anisotropy_ratio)
+            loss += geometry_weights["scale"] * scale_loss
+            loss_terms["scale"] = scale_loss
 
         # Depth regularization
         Ll1depth_pure = 0.0
         if depth_l1_weight(iteration) > 0 and viewpoint_cam.depth_reliable:
-            invDepth = render_pkg["depth"]
+            invDepth = render_pkg["invdepth"]
             mono_invdepth = viewpoint_cam.invdepthmap.cuda()
             depth_mask = viewpoint_cam.depth_mask.cuda()
 
@@ -163,22 +203,50 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Log and save
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, psnr_max)
+            if tb_writer:
+                for name, value in loss_terms.items():
+                    tb_writer.add_scalar(f"loss/{name}", value.item(), iteration)
+                tb_writer.add_scalar("loss/total", loss.item(), iteration)
+                tb_writer.add_scalar("gaussians/count", gaussians.get_xyz.shape[0], iteration)
+                tb_writer.add_scalar("gaussians/mean_opacity", gaussians.get_opacity.mean().item(), iteration)
+                tb_writer.add_scalar("gaussians/mean_scale", gaussians.get_scaling.mean().item(), iteration)
+                tb_writer.add_scalar("gaussians/max_scale", gaussians.get_scaling.max().item(), iteration)
+                if opt.geometry_aware and iteration % 100 == 0:
+                    tb_writer.add_images("render/depth", render_pkg["depth"].clamp_min(0)[None], iteration)
+                    tb_writer.add_images("render/normal", ((render_pkg["normal"] + 1) * 0.5).clamp(0, 1)[None], iteration)
+                    tb_writer.add_images("prior/edge", edge_map[None] if edge_map is not None else torch.zeros_like(render_pkg["depth"])[None], iteration)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
             # Densification
+            gaussians.advance_gaussian_age()
             if iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                if opt.geometry_aware:
+                    residual_map = (image.detach() - gt_image.detach()).abs().mean(dim=0)
+                    if edge_map is None:
+                        edge_map = torch.zeros_like(residual_map).unsqueeze(0)
+                    gaussians.accumulate_geometry_stats(viewpoint_cam, visibility_filter, residual_map, edge_map, radii)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    if opt.geometry_aware:
+                        gaussians.densify_and_prune_geometry(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, opt)
+                    else:
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
+
+            if (opt.geometry_aware and opt.importance_pruning_enabled and
+                    iteration >= opt.importance_pruning_start_iter and
+                    iteration % opt.importance_pruning_interval == 0):
+                pruned = gaussians.prune_low_importance(opt)
+                if pruned:
+                    print(f"[BTS-GeoGS] Importance-pruned {pruned} Gaussians at iteration {iteration}.")
 
             # Optimizer step
             if iteration < opt.iterations:
@@ -276,6 +344,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--psnr_max", type=float, default=30.0)
+    parser.add_argument("--config", type=str, default=None, help="Optional BTS-GeoGS YAML preset; explicit CLI flags take precedence.")
+    config_args, _ = parser.parse_known_args(sys.argv[1:])
+    if config_args.config:
+        parser.set_defaults(**load_bts_geogs_config(config_args.config))
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     

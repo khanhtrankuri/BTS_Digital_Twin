@@ -14,8 +14,39 @@ import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+from utils.general_utils import build_rotation
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+
+def _rasterize_auxiliary_feature(rasterizer, means3D, means2D, opacity, scales,
+                                 rotations, cov3D_precomp, feature):
+    """Alpha-composite an arbitrary per-Gaussian 3-vector.
+
+    The bundled rasterizer already accepts ``colors_precomp``.  Reusing that
+    supported interface avoids a CUDA ABI change while remaining fully
+    differentiable with respect to Gaussian positions, scale and opacity.
+    """
+    feature = feature.contiguous()
+    image, _, _ = rasterizer(
+        means3D=means3D, means2D=means2D, shs=None,
+        colors_precomp=feature, opacities=opacity, scales=scales,
+        rotations=rotations, cov3D_precomp=cov3D_precomp)
+    return image
+
+
+def _camera_space_depth(points, camera):
+    homogeneous = torch.cat((points, torch.ones_like(points[:, :1])), dim=1)
+    return (homogeneous @ camera.world_view_transform)[:, 2:3]
+
+
+def _camera_space_normals(pc, camera):
+    rotations = build_rotation(pc.get_rotation)
+    min_axis = pc.get_scaling.argmin(dim=-1)
+    normal = rotations[torch.arange(rotations.shape[0], device=rotations.device), :, min_axis]
+    # Camera transforms in this repository are stored for row-vector use.
+    normal = normal @ camera.world_view_transform[:3, :3]
+    return torch.nn.functional.normalize(normal, dim=-1, eps=1e-6)
+
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, render_geometry=False):
     """
     Render the scene. 
     
@@ -122,7 +153,38 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "viewspace_points": screenspace_points,
         "visibility_filter" : (radii > 0).nonzero(),
         "radii": radii,
-        "depth" : depth_image
+        # Legacy inverse depth remains available by its explicit name.
+        "invdepth": depth_image,
+        "depth": depth_image,
+        "normal": None,
+        "alpha": None,
         }
+
+    if render_geometry:
+        # The existing CUDA extension composites arbitrary 3-channel features.
+        # Render z, normal and a one-vector against a zero background to obtain
+        # alpha-composited depth, normal and alpha without changing the kernel.
+        zero_bg_settings = GaussianRasterizationSettings(
+            image_height=int(viewpoint_camera.image_height), image_width=int(viewpoint_camera.image_width),
+            tanfovx=tanfovx, tanfovy=tanfovy, bg=torch.zeros_like(bg_color),
+            scale_modifier=scaling_modifier, viewmatrix=viewpoint_camera.world_view_transform,
+            projmatrix=viewpoint_camera.full_proj_transform, sh_degree=pc.active_sh_degree,
+            campos=viewpoint_camera.camera_center, prefiltered=False, debug=pipe.debug,
+            antialiasing=pipe.antialiasing)
+        aux_rasterizer = GaussianRasterizer(raster_settings=zero_bg_settings)
+        alpha_rgb = _rasterize_auxiliary_feature(aux_rasterizer, means3D, means2D, opacity, scales,
+                                                  rotations, cov3D_precomp, torch.ones_like(means3D))
+        alpha = torch.clamp(alpha_rgb[:1], 0.0, 1.0)
+        z = torch.clamp(_camera_space_depth(means3D, viewpoint_camera), min=1e-6).repeat(1, 3)
+        depth_sum = _rasterize_auxiliary_feature(aux_rasterizer, means3D, means2D, opacity, scales,
+                                                  rotations, cov3D_precomp, z)[:1]
+        normal_sum = _rasterize_auxiliary_feature(aux_rasterizer, means3D, means2D, opacity, scales,
+                                                   rotations, cov3D_precomp,
+                                                   _camera_space_normals(pc, viewpoint_camera))
+        valid = alpha > 1e-6
+        depth = torch.where(valid, depth_sum / alpha.clamp_min(1e-6), torch.zeros_like(depth_sum))
+        normal = torch.nn.functional.normalize(normal_sum, dim=0, eps=1e-6)
+        normal = torch.where(valid.expand_as(normal), normal, torch.zeros_like(normal))
+        out.update({"depth": depth, "normal": normal, "alpha": alpha})
     
     return out

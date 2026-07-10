@@ -15,6 +15,7 @@ import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix, fov2focal
 from utils.general_utils import PILtoTorch
 import cv2
+import torch.nn.functional as F
 
 class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
@@ -22,7 +23,8 @@ class Camera(nn.Module):
                  cx=None, cy=None, source_width=None, source_height=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  train_test_exp = False, is_test_dataset = False, is_test_view = False,
-                 has_ground_truth = True
+                 has_ground_truth = True, depth_prior=None, normal_prior=None,
+                 confidence_map=None, compute_edge=False
                  ):
         super(Camera, self).__init__()
 
@@ -85,6 +87,30 @@ class Camera(nn.Module):
             if self.invdepthmap.ndim != 2:
                 self.invdepthmap = self.invdepthmap[..., 0]
             self.invdepthmap = torch.from_numpy(self.invdepthmap[None]).to(self.data_device)
+
+        def resize_prior(prior, channels, mode):
+            if prior is None:
+                return None
+            prior = torch.as_tensor(prior, dtype=torch.float32, device=self.data_device)
+            if prior.ndim == 2:
+                prior = prior.unsqueeze(0)
+            if prior.ndim != 3 or prior.shape[0] not in (1, channels):
+                raise ValueError(f"Expected a [C,H,W] geometry prior with C={channels}.")
+            prior = prior.unsqueeze(0)
+            kwargs = {"align_corners": False} if mode != "nearest" else {}
+            return F.interpolate(prior, size=(self.image_height, self.image_width), mode=mode, **kwargs).squeeze(0)
+
+        self.depth_prior = resize_prior(depth_prior, 1, "bilinear")
+        self.normal_prior = resize_prior(normal_prior, 3, "bilinear")
+        if self.normal_prior is not None:
+            self.normal_prior = F.normalize(torch.nan_to_num(self.normal_prior), dim=0, eps=1e-6)
+        self.confidence_map = resize_prior(confidence_map, 1, "bilinear")
+        if self.confidence_map is not None:
+            self.confidence_map = torch.clamp(torch.nan_to_num(self.confidence_map), 0.0, 1.0)
+        self.edge_map = None
+        if compute_edge:
+            from utils.geometry_losses import sobel_edge_map
+            self.edge_map = sobel_edge_map(self.original_image)
 
         self.zfar = 100.0
         self.znear = 0.01

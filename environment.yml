@@ -14,6 +14,7 @@ dependencies:
   - plyfile
   - cmake
   - ninja
+  - pytest
   - cuda-nvcc=12.8
   - vs2022_win-64
   - pip:
@@ -23,6 +24,7 @@ dependencies:
       - torchaudio==2.7.1+cu128
       - opencv-python
       - joblib
+      - pyyaml
 
 # After creating the env from this file, build the local CUDA extensions from
 # the repository root:

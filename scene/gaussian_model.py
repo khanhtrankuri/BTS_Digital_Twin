@@ -60,13 +60,21 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.residual_accum = torch.empty(0)
+        self.edge_accum = torch.empty(0)
+        self.visibility_count = torch.empty(0, dtype=torch.long)
+        self.gaussian_age = torch.empty(0, dtype=torch.long)
+        self.importance_accum = torch.empty(0)
+        self.projected_area_accum = torch.empty(0)
+        self.geometry_aware = False
+        self._last_densify_counts = {"cloned": 0, "split": 0, "pruned": 0}
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
 
     def capture(self):
-        return (
+        legacy = (
             self.active_sh_degree,
             self._xyz,
             self._features_dc,
@@ -80,8 +88,16 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
+        # Disabled mode emits the exact historic tuple and allocates no stats.
+        if not self.geometry_aware:
+            return legacy
+        # Appending preserves the ability to load every historic 12-tuple.
+        return legacy + ((self.residual_accum, self.edge_accum, self.visibility_count,
+                          self.gaussian_age, self.importance_accum,
+                          self.projected_area_accum),)
     
     def restore(self, model_args, training_args):
+        legacy_args = model_args[:12]
         (self.active_sh_degree, 
         self._xyz, 
         self._features_dc, 
@@ -93,10 +109,16 @@ class GaussianModel:
         xyz_gradient_accum, 
         denom,
         opt_dict, 
-        self.spatial_lr_scale) = model_args
+        self.spatial_lr_scale) = legacy_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        if len(model_args) > 12:
+            buffers = model_args[12]
+            if len(buffers) == 6 and buffers[0].shape[0] == self.get_xyz.shape[0]:
+                (self.residual_accum, self.edge_accum, self.visibility_count,
+                 self.gaussian_age, self.importance_accum,
+                 self.projected_area_accum) = [item.to(self.get_xyz.device) for item in buffers]
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -175,10 +197,76 @@ class GaussianModel:
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
+    @staticmethod
+    def _knn_mean_distance(points, k):
+        """Bounded-memory KNN distances; never materializes an N-by-N matrix."""
+        n = points.shape[0]
+        if n < 2:
+            return torch.full((n,), 1e-3, device=points.device)
+        k = max(1, min(int(k), n - 1))
+        if k == 1:
+            return torch.sqrt(torch.clamp_min(distCUDA2(points), 1e-8))
+        result = torch.empty(n, device=points.device)
+        chunk = min(2048, n)
+        for start in range(0, n, chunk):
+            end = min(start + chunk, n)
+            distances = torch.cdist(points[start:end], points)
+            rows = torch.arange(end - start, device=points.device)
+            distances[rows, torch.arange(start, end, device=points.device)] = float("inf")
+            result[start:end] = distances.topk(k, largest=False).values.mean(dim=1)
+        return result.clamp_min(1e-4)
+
+    @staticmethod
+    def _quaternion_from_z(normals):
+        """Quaternion whose local z axis is aligned to each unit normal."""
+        normals = torch.nn.functional.normalize(normals, dim=1, eps=1e-6)
+        z = torch.tensor([0.0, 0.0, 1.0], device=normals.device).expand_as(normals)
+        cross = torch.cross(z, normals, dim=1)
+        dot = (z * normals).sum(1, keepdim=True)
+        quat = torch.cat((1.0 + dot, cross), dim=1)
+        antiparallel = quat[:, 0].abs() < 1e-6
+        quat[antiparallel] = torch.tensor([0.0, 1.0, 0.0, 0.0], device=normals.device)
+        return torch.nn.functional.normalize(quat, dim=1, eps=1e-6)
+
+    def create_from_dense_prior(self, data, cam_infos, spatial_lr_scale, options):
+        """Initialize the standard 3DGS representation from an offline prior."""
+        points = torch.as_tensor(data["points"], dtype=torch.float32, device="cuda")
+        colors = torch.as_tensor(data["colors"], dtype=torch.float32, device="cuda").clamp(0, 1)
+        if points.shape[0] == 0:
+            raise ValueError("Dense prior has no valid points after confidence/voxel filtering.")
+        self.spatial_lr_scale = spatial_lr_scale
+        features = torch.zeros((points.shape[0], 3, (self.max_sh_degree + 1) ** 2), device="cuda")
+        features[:, :, 0] = RGB2SH(colors)
+        knn = self._knn_mean_distance(points, options.dense_prior_knn_k)
+        scales = torch.log(knn[:, None].repeat(1, 3))
+        rotations = torch.zeros((points.shape[0], 4), device="cuda")
+        rotations[:, 0] = 1.0
+        if options.initialize_rotation_from_normal and data.get("normals") is not None:
+            rotations = self._quaternion_from_z(torch.as_tensor(data["normals"], dtype=torch.float32, device="cuda"))
+            # Make local z the minor axis, matching the rendered-normal rule.
+            scales[:, 2] = scales[:, 2] + np.log(0.8)
+        opacity = 0.1 * torch.ones((points.shape[0], 1), device="cuda")
+        if options.initialize_opacity_from_confidence and data.get("confidence") is not None:
+            confidence = torch.as_tensor(data["confidence"], dtype=torch.float32, device="cuda").clamp(0, 1)
+            opacity = 0.01 + 0.49 * confidence[:, None]
+        self._xyz = nn.Parameter(points.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:, :, :1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rotations.requires_grad_(True))
+        self._opacity = nn.Parameter(self.inverse_opacity_activation(opacity).requires_grad_(True))
+        self.max_radii2D = torch.zeros(points.shape[0], device="cuda")
+        self.exposure_mapping = {cam.image_name: idx for idx, cam in enumerate(cam_infos)}
+        self.pretrained_exposures = None
+        self._exposure = nn.Parameter(torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1).requires_grad_(True))
+        print(f"BTS-GeoGS dense initialization: {points.shape[0]} points")
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self.geometry_aware = getattr(training_args, "geometry_aware", False)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self._reset_geometry_buffers()
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -209,6 +297,24 @@ class GaussianModel:
                                                         lr_delay_steps=training_args.exposure_lr_delay_steps,
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
+
+    def _reset_geometry_buffers(self):
+        """Initialize side statistics without adding optimizer parameters."""
+        n, device = self.get_xyz.shape[0], self.get_xyz.device
+        if not self.geometry_aware:
+            self.residual_accum = torch.empty(0, device=device)
+            self.edge_accum = torch.empty(0, device=device)
+            self.visibility_count = torch.empty(0, device=device, dtype=torch.long)
+            self.gaussian_age = torch.empty(0, device=device, dtype=torch.long)
+            self.importance_accum = torch.empty(0, device=device)
+            self.projected_area_accum = torch.empty(0, device=device)
+            return
+        self.residual_accum = torch.zeros((n, 1), device=device)
+        self.edge_accum = torch.zeros((n, 1), device=device)
+        self.visibility_count = torch.zeros((n, 1), device=device, dtype=torch.long)
+        self.gaussian_age = torch.zeros((n, 1), device=device, dtype=torch.long)
+        self.importance_accum = torch.zeros((n, 1), device=device)
+        self.projected_area_accum = torch.zeros((n, 1), device=device)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -361,7 +467,13 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
+        for name in ("residual_accum", "edge_accum", "visibility_count", "gaussian_age",
+                     "importance_accum", "projected_area_accum"):
+            value = getattr(self, name)
+            if value.numel() == valid_points_mask.shape[0]:
+                setattr(self, name, value[valid_points_mask])
+        if getattr(self, "tmp_radii", None) is not None:
+            self.tmp_radii = self.tmp_radii[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -402,18 +514,33 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
-        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if self.geometry_aware:
+            count = new_xyz.shape[0]
+            def extend(name):
+                value = getattr(self, name)
+                return torch.cat((value, torch.zeros((count, value.shape[1]), device=value.device, dtype=value.dtype)), dim=0)
+            self.xyz_gradient_accum = extend("xyz_gradient_accum")
+            self.denom = extend("denom")
+            self.max_radii2D = torch.cat((self.max_radii2D, torch.zeros(count, device=self.max_radii2D.device)))
+            for name in ("residual_accum", "edge_accum", "visibility_count", "gaussian_age",
+                         "importance_accum", "projected_area_accum"):
+                setattr(self, name, extend(name))
+        else:
+            self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+            self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+            self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, selected_pts_mask=None):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
-        selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        if selected_pts_mask is None:
+            selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
+            selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                                  torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        if not selected_pts_mask.any():
+            return 0
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -431,12 +558,16 @@ class GaussianModel:
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
+        return int(selected_pts_mask.sum().item())
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, selected_pts_mask=None):
         # Extract points that satisfy the gradient condition
-        selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask,
-                                              torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        if selected_pts_mask is None:
+            selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
+            selected_pts_mask = torch.logical_and(selected_pts_mask,
+                                                  torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        if not selected_pts_mask.any():
+            return 0
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -448,6 +579,7 @@ class GaussianModel:
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        return int(selected_pts_mask.sum().item())
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
@@ -469,5 +601,98 @@ class GaussianModel:
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
+        if viewspace_point_tensor.grad is None:
+            return
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def advance_gaussian_age(self):
+        if self.geometry_aware and self.gaussian_age.numel():
+            self.gaussian_age.add_(1)
+
+    def accumulate_geometry_stats(self, camera, visibility_filter, residual_map, edge_map, radii):
+        """Accumulate per-Gaussian residual/edge statistics from projected centers."""
+        if not self.geometry_aware or self.get_xyz.numel() == 0:
+            return
+        visible = (radii > 0).reshape(-1)
+        if not visible.any():
+            return
+        homogeneous = torch.cat((self.get_xyz.detach(), torch.ones_like(self.get_xyz[:, :1])), dim=1)
+        clip = homogeneous @ camera.full_proj_transform
+        ndc = clip[:, :2] / clip[:, 3:4].clamp_min(1e-6)
+        x = ((ndc[:, 0] + 1.0) * 0.5 * (camera.image_width - 1)).round().long().clamp(0, camera.image_width - 1)
+        y = ((ndc[:, 1] + 1.0) * 0.5 * (camera.image_height - 1)).round().long().clamp(0, camera.image_height - 1)
+        residual = torch.nan_to_num(residual_map.detach())[y, x].unsqueeze(1)
+        edge = torch.nan_to_num(edge_map.detach().squeeze(0))[y, x].unsqueeze(1)
+        visible_2d = visible.unsqueeze(1)
+        self.residual_accum[visible_2d] += residual[visible_2d]
+        self.edge_accum[visible_2d] += edge[visible_2d]
+        self.visibility_count[visible_2d] += 1
+        area = radii.detach().float().square().unsqueeze(1)
+        self.projected_area_accum[visible_2d] += area[visible_2d]
+        self.importance_accum[visible_2d] += self.get_opacity.detach()[visible_2d]
+
+    @staticmethod
+    def _limit_mask(mask, score, limit):
+        if limit <= 0:
+            return torch.zeros_like(mask)
+        indices = torch.nonzero(mask, as_tuple=False).squeeze(1)
+        if indices.numel() <= limit:
+            return mask
+        top = indices[torch.topk(score[indices], k=limit).indices]
+        result = torch.zeros_like(mask)
+        result[top] = True
+        return result
+
+    def densify_and_prune_geometry(self, max_grad, min_opacity, extent, max_screen_size, radii, opt):
+        """Bounded residual/edge-aware densification; baseline uses its old path."""
+        self.tmp_radii = radii
+        denom = self.denom.clamp_min(1.0)
+        gradient = torch.nan_to_num((self.xyz_gradient_accum / denom).squeeze(1))
+        residual = (self.residual_accum / self.visibility_count.clamp_min(1)).squeeze(1)
+        edge = (self.edge_accum / self.visibility_count.clamp_min(1)).squeeze(1)
+        score = float(opt.densification_gradient_weight) * gradient
+        if opt.densification_residual_aware:
+            score = score + float(opt.densification_residual_weight) * residual * float(max_grad)
+        if opt.densification_edge_aware:
+            score = score + float(opt.densification_edge_weight) * edge * float(max_grad)
+        eligible = (score >= max_grad) & (self.visibility_count.squeeze(1) >= opt.importance_pruning_min_visibility_count)
+        eligible &= self.gaussian_age.squeeze(1) >= int(opt.min_gaussian_age)
+        small = self.get_scaling.max(dim=1).values <= self.percent_dense * extent
+        clone_mask, split_mask = eligible & small, eligible & ~small
+        budget = max(0, int(opt.max_gaussians) - self.get_xyz.shape[0])
+        clone_mask = self._limit_mask(clone_mask, score, budget)
+        budget -= int(clone_mask.sum().item())
+        # A split temporarily appends two children before pruning its parent.
+        # Reserve both slots so MAX_GAUSSIANS is respected even mid-operation.
+        split_mask = self._limit_mask(split_mask, score, budget // 2)
+        cloned = self.densify_and_clone(gradient.unsqueeze(1), max_grad, extent, clone_mask)
+        if cloned:
+            gradient = torch.cat((gradient, torch.zeros(cloned, device=gradient.device)))
+            split_mask = torch.cat((split_mask, torch.zeros(cloned, device=split_mask.device, dtype=torch.bool)))
+        split = self.densify_and_split(gradient.unsqueeze(1), max_grad, extent, 2, split_mask)
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            prune_mask |= (self.max_radii2D > max_screen_size)
+            prune_mask |= (self.get_scaling.max(dim=1).values > 0.1 * extent)
+        pruned = int(prune_mask.sum().item())
+        if pruned and pruned < self.get_xyz.shape[0]:
+            self.prune_points(prune_mask)
+        self.tmp_radii = None
+        self._last_densify_counts = {"cloned": cloned, "split": split, "pruned": pruned}
+
+    def prune_low_importance(self, opt):
+        if self.get_xyz.shape[0] <= 1:
+            return 0
+        visibility = self.visibility_count.float().clamp_min(1.0)
+        importance = (self.importance_accum / visibility) * torch.log1p(self.visibility_count.float()) * (self.projected_area_accum / visibility)
+        self.last_mean_importance = importance.mean().item()
+        low = importance.squeeze(1) < float(opt.importance_pruning_threshold)
+        weak = (self.get_opacity.squeeze(1) < float(opt.importance_pruning_min_opacity)) | (self.visibility_count.squeeze(1) < int(opt.importance_pruning_min_visibility_count))
+        mask = low & weak & (self.gaussian_age.squeeze(1) > int(opt.min_gaussian_age))
+        if mask.any() and (~mask).any():
+            count = int(mask.sum().item())
+            self.prune_points(mask)
+            self._last_densify_counts["pruned"] += count
+            return count
+        return 0

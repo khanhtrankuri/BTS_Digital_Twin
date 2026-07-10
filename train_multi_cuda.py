@@ -93,6 +93,32 @@ def build_train_command(args, source_path, model_path, gpu_index, job_index):
     return cmd, env
 
 
+def validate_gpus(gpus, args):
+    for gpu_index in gpus:
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+        result = subprocess.run(
+            [
+                args.python,
+                "-c",
+                "import torch; raise SystemExit(0 if torch.cuda.is_available() and torch.cuda.device_count() > 0 else 1)",
+            ],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip()
+            message = (
+                f"CUDA device '{gpu_index}' is not available to {args.python}. "
+                "Use only visible device ids, for example '--gpus 0' on a single-GPU machine."
+            )
+            if detail:
+                message += f"\nTorch error:\n{detail}"
+            raise SystemExit(message)
+
+
 def worker(worker_id, gpu_index, jobs, args, failures):
     while True:
         try:
@@ -202,6 +228,9 @@ def main():
     gpus = parse_csv(args.gpus)
     if not gpus:
         raise SystemExit("No GPUs were provided. Example: --gpus 0,1")
+
+    if not args.dry_run:
+        validate_gpus(gpus, args)
 
     if args.model_paths is not None and len(args.model_paths) != len(args.source_paths):
         raise SystemExit(
