@@ -1,0 +1,8 @@
+OPTIMIZATION:
+  geometry_aware: true
+  densification_method: hybrid
+  exposure_compensation: true
+  loss_schedule_enabled: true
+  loss_stage_a_end: 12000
+  loss_stage_b_end: 30000
+  loss_stage_c_end: 45000

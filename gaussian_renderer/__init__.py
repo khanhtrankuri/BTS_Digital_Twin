@@ -46,7 +46,7 @@ def _camera_space_normals(pc, camera):
     normal = normal @ camera.world_view_transform[:3, :3]
     return torch.nn.functional.normalize(normal, dim=-1, eps=1e-6)
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, render_geometry=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, render_geometry=False, apply_exposure=False):
     """
     Render the scene. 
     
@@ -141,7 +141,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             cov3D_precomp = cov3D_precomp)
         
     # Apply exposure to rendered image (training only)
-    if use_trained_exp:
+    if use_trained_exp or apply_exposure:
         exposure = pc.get_exposure_from_name(viewpoint_camera.image_name)
         rendered_image = torch.matmul(rendered_image.permute(1, 2, 0), exposure[:3, :3]).permute(2, 0, 1) + exposure[:3, 3,   None, None]
 

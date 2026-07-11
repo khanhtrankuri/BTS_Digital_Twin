@@ -1,0 +1,5 @@
+OPTIMIZATION:
+  geometry_aware: false
+  loss_schedule_enabled: false
+  exposure_compensation: false
+  densification_method: original

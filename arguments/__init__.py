@@ -63,6 +63,7 @@ def load_bts_geogs_config(path):
         ("INITIALIZATION", "INITIALIZE_OPACITY_FROM_CONFIDENCE"): "initialize_opacity_from_confidence",
     }
     defaults = dict(config.get("OPTIMIZATION", {}))
+    defaults.update(config.get("PIPELINE", {}))
     for key_path, argument in mapping.items():
         node = config
         for key in key_path:
@@ -200,6 +201,35 @@ class OptimizationParams(ParamGroup):
         self.dense_prior_knn_k = 8
         self.initialize_rotation_from_normal = False
         self.initialize_opacity_from_confidence = False
+        # BTS-GeoGS-v2 appearance and staged metric optimization (all opt-in).
+        self.exposure_compensation = False
+        self.exposure_start_iter = 500
+        self.exposure_end_iter = 30_000
+        self.exposure_matrix_reg_weight = 0.001
+        self.exposure_bias_reg_weight = 0.001
+        self.exposure_max_gain = 1.5
+        self.exposure_max_bias = 0.2
+        self.test_exposure_mode = "identity"
+        self.loss_schedule_enabled = False
+        self.loss_stage_a_end = 12_000
+        self.loss_stage_b_end = 30_000
+        self.loss_stage_c_end = 45_000
+        self.loss_stage_a_l1, self.loss_stage_a_mse, self.loss_stage_a_dssim = 0.70, 0.05, 0.20
+        self.loss_stage_b_l1, self.loss_stage_b_mse, self.loss_stage_b_dssim = 0.40, 0.35, 0.25
+        self.loss_stage_c_l1, self.loss_stage_c_mse, self.loss_stage_c_dssim = 0.15, 0.60, 0.25
+        self.loss_stage_a_geometry, self.loss_stage_a_edge, self.loss_stage_a_exposure = 1.0, 0.5, 1.0
+        self.loss_stage_b_geometry, self.loss_stage_b_edge, self.loss_stage_b_exposure = 0.2, 1.0, 1.0
+        self.loss_stage_c_geometry, self.loss_stage_c_edge, self.loss_stage_c_exposure = 0.0, 0.2, 0.1
+        self.lr_stage_a_xyz, self.lr_stage_a_scaling, self.lr_stage_a_rotation = 1.0, 1.0, 1.0
+        self.lr_stage_a_features, self.lr_stage_a_opacity, self.lr_stage_a_exposure = 1.0, 1.0, 1.0
+        self.lr_stage_b_xyz, self.lr_stage_b_scaling, self.lr_stage_b_rotation = 0.5, 0.5, 0.5
+        self.lr_stage_b_features, self.lr_stage_b_opacity, self.lr_stage_b_exposure = 1.0, 0.5, 0.5
+        self.lr_stage_c_xyz, self.lr_stage_c_scaling, self.lr_stage_c_rotation = 0.1, 0.1, 0.1
+        self.lr_stage_c_features, self.lr_stage_c_opacity, self.lr_stage_c_exposure = 0.5, 0.2, 0.1
+        self.densification_method = "original"
+        self.densification_abs_grad_weight = 1.0
+        self.densification_original_grad_weight = 0.5
+        self.densification_abs_grad_threshold = 0.0008
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

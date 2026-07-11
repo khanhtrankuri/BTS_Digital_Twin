@@ -1,0 +1,19 @@
+OPTIMIZATION:
+  geometry_aware: true
+  densification_method: hybrid
+  densify_from_iter: 500
+  densify_until_iter: 15000
+  densification_interval: 100
+  densify_grad_threshold: 0.0002
+  densification_abs_grad_threshold: 0.0008
+  max_gaussians: 2500000
+  min_gaussian_age: 200
+  exposure_compensation: true
+  exposure_start_iter: 500
+  exposure_end_iter: 45000
+  loss_schedule_enabled: true
+  loss_stage_a_end: 12000
+  loss_stage_b_end: 30000
+  loss_stage_c_end: 45000
+PIPELINE:
+  antialiasing: true

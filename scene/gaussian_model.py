@@ -21,6 +21,7 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils.training_schedules import get_lr_multipliers
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -59,6 +60,7 @@ class GaussianModel:
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
+        self.xyz_gradient_abs_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.residual_accum = torch.empty(0)
         self.edge_accum = torch.empty(0)
@@ -92,7 +94,7 @@ class GaussianModel:
         if not self.geometry_aware:
             return legacy
         # Appending preserves the ability to load every historic 12-tuple.
-        return legacy + ((self.residual_accum, self.edge_accum, self.visibility_count,
+        return legacy + ((self.xyz_gradient_abs_accum, self.residual_accum, self.edge_accum, self.visibility_count,
                           self.gaussian_age, self.importance_accum,
                           self.projected_area_accum),)
     
@@ -115,10 +117,13 @@ class GaussianModel:
         self.denom = denom
         if len(model_args) > 12:
             buffers = model_args[12]
-            if len(buffers) == 6 and buffers[0].shape[0] == self.get_xyz.shape[0]:
-                (self.residual_accum, self.edge_accum, self.visibility_count,
-                 self.gaussian_age, self.importance_accum,
-                 self.projected_area_accum) = [item.to(self.get_xyz.device) for item in buffers]
+            if len(buffers) in (6, 7) and buffers[0].shape[0] == self.get_xyz.shape[0]:
+                if len(buffers) == 6:  # GeoGS-v1 checkpoint: abs proxy starts at zero.
+                    (self.residual_accum, self.edge_accum, self.visibility_count, self.gaussian_age,
+                     self.importance_accum, self.projected_area_accum) = [item.to(self.get_xyz.device) for item in buffers]
+                else:
+                    (self.xyz_gradient_abs_accum, self.residual_accum, self.edge_accum, self.visibility_count,
+                     self.gaussian_age, self.importance_accum, self.projected_area_accum) = [item.to(self.get_xyz.device) for item in buffers]
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -262,6 +267,7 @@ class GaussianModel:
         print(f"BTS-GeoGS dense initialization: {points.shape[0]} points")
 
     def training_setup(self, training_args):
+        self.training_args = training_args
         self.percent_dense = training_args.percent_dense
         self.geometry_aware = getattr(training_args, "geometry_aware", False)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -303,6 +309,7 @@ class GaussianModel:
         n, device = self.get_xyz.shape[0], self.get_xyz.device
         if not self.geometry_aware:
             self.residual_accum = torch.empty(0, device=device)
+            self.xyz_gradient_abs_accum = torch.empty(0, device=device)
             self.edge_accum = torch.empty(0, device=device)
             self.visibility_count = torch.empty(0, device=device, dtype=torch.long)
             self.gaussian_age = torch.empty(0, device=device, dtype=torch.long)
@@ -310,6 +317,7 @@ class GaussianModel:
             self.projected_area_accum = torch.empty(0, device=device)
             return
         self.residual_accum = torch.zeros((n, 1), device=device)
+        self.xyz_gradient_abs_accum = torch.zeros((n, 1), device=device)
         self.edge_accum = torch.zeros((n, 1), device=device)
         self.visibility_count = torch.zeros((n, 1), device=device, dtype=torch.long)
         self.gaussian_age = torch.zeros((n, 1), device=device, dtype=torch.long)
@@ -320,13 +328,21 @@ class GaussianModel:
         ''' Learning rate scheduling per step '''
         if self.pretrained_exposures is None:
             for param_group in self.exposure_optimizer.param_groups:
-                param_group['lr'] = self.exposure_scheduler_args(iteration)
+                param_group['lr'] = self.exposure_scheduler_args(iteration) * get_lr_multipliers(iteration, self.training_args)["exposure"]
 
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
+                lr = self.xyz_scheduler_args(iteration) * get_lr_multipliers(iteration, self.training_args)["xyz"]
                 param_group['lr'] = lr
-                return lr
+            elif param_group["name"] == "f_dc" or param_group["name"] == "f_rest":
+                param_group['lr'] = self.training_args.feature_lr * get_lr_multipliers(iteration, self.training_args)["features"] * (1.0 if param_group["name"] == "f_dc" else 1.0 / 20.0)
+            elif param_group["name"] == "opacity":
+                param_group['lr'] = self.training_args.opacity_lr * get_lr_multipliers(iteration, self.training_args)["opacity"]
+            elif param_group["name"] == "scaling":
+                param_group['lr'] = self.training_args.scaling_lr * get_lr_multipliers(iteration, self.training_args)["scaling"]
+            elif param_group["name"] == "rotation":
+                param_group['lr'] = self.training_args.rotation_lr * get_lr_multipliers(iteration, self.training_args)["rotation"]
+        return lr
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -467,7 +483,7 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        for name in ("residual_accum", "edge_accum", "visibility_count", "gaussian_age",
+        for name in ("xyz_gradient_abs_accum", "residual_accum", "edge_accum", "visibility_count", "gaussian_age",
                      "importance_accum", "projected_area_accum"):
             value = getattr(self, name)
             if value.numel() == valid_points_mask.shape[0]:
@@ -522,7 +538,7 @@ class GaussianModel:
             self.xyz_gradient_accum = extend("xyz_gradient_accum")
             self.denom = extend("denom")
             self.max_radii2D = torch.cat((self.max_radii2D, torch.zeros(count, device=self.max_radii2D.device)))
-            for name in ("residual_accum", "edge_accum", "visibility_count", "gaussian_age",
+            for name in ("xyz_gradient_abs_accum", "residual_accum", "edge_accum", "visibility_count", "gaussian_age",
                          "importance_accum", "projected_area_accum"):
                 setattr(self, name, extend(name))
         else:
@@ -603,8 +619,29 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         if viewspace_point_tensor.grad is None:
             return
-        self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
+        gradient_xy = viewspace_point_tensor.grad[update_filter, :2]
+        self.xyz_gradient_accum[update_filter] += torch.norm(gradient_xy, dim=-1, keepdim=True)
+        if self.geometry_aware:
+            # CUDA exposes only the gradient of the summed image loss. This is
+            # an L1 proxy of that aggregate, not exact AbsGS per-pixel |grad|.
+            self.xyz_gradient_abs_accum[update_filter] += gradient_xy.abs().sum(dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    @staticmethod
+    def compute_densification_score(original_grad, absolute_grad=None, residual=None, edge_score=None, cfg=None):
+        method = getattr(cfg, "densification_method", "original")
+        if method == "original":
+            return original_grad
+        if method == "absolute_gradient":
+            return absolute_grad if absolute_grad is not None else original_grad
+        score = float(cfg.densification_original_grad_weight) * original_grad
+        if absolute_grad is not None:
+            score = score + float(cfg.densification_abs_grad_weight) * absolute_grad
+        if residual is not None:
+            score = score + float(cfg.densification_residual_weight) * residual * float(cfg.densify_grad_threshold)
+        if edge_score is not None:
+            score = score + float(cfg.densification_edge_weight) * edge_score * float(cfg.densify_grad_threshold)
+        return score
 
     def advance_gaussian_age(self):
         if self.geometry_aware and self.gaussian_age.numel():
@@ -649,14 +686,15 @@ class GaussianModel:
         self.tmp_radii = radii
         denom = self.denom.clamp_min(1.0)
         gradient = torch.nan_to_num((self.xyz_gradient_accum / denom).squeeze(1))
+        absolute_gradient = torch.nan_to_num((self.xyz_gradient_abs_accum / denom).squeeze(1))
         residual = (self.residual_accum / self.visibility_count.clamp_min(1)).squeeze(1)
         edge = (self.edge_accum / self.visibility_count.clamp_min(1)).squeeze(1)
-        score = float(opt.densification_gradient_weight) * gradient
-        if opt.densification_residual_aware:
-            score = score + float(opt.densification_residual_weight) * residual * float(max_grad)
-        if opt.densification_edge_aware:
-            score = score + float(opt.densification_edge_weight) * edge * float(max_grad)
-        eligible = (score >= max_grad) & (self.visibility_count.squeeze(1) >= opt.importance_pruning_min_visibility_count)
+        score = self.compute_densification_score(
+            gradient, absolute_gradient,
+            residual if opt.densification_residual_aware else None,
+            edge if opt.densification_edge_aware else None, opt)
+        threshold = float(opt.densification_abs_grad_threshold) if opt.densification_method == "absolute_gradient" else float(max_grad)
+        eligible = (score >= threshold) & (self.visibility_count.squeeze(1) >= opt.importance_pruning_min_visibility_count)
         eligible &= self.gaussian_age.squeeze(1) >= int(opt.min_gaussian_age)
         small = self.get_scaling.max(dim=1).values <= self.percent_dense * extent
         clone_mask, split_mask = eligible & small, eligible & ~small

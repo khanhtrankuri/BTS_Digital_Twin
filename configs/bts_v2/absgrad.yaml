@@ -1,0 +1,9 @@
+OPTIMIZATION:
+  geometry_aware: true
+  densification_method: absolute_gradient
+  densify_from_iter: 500
+  densify_until_iter: 15000
+  densification_interval: 100
+  densification_abs_grad_threshold: 0.0008
+  max_gaussians: 2500000
+  min_gaussian_age: 200

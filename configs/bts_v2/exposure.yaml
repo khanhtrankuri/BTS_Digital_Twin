@@ -1,0 +1,10 @@
+OPTIMIZATION:
+  geometry_aware: true
+  densification_method: hybrid
+  exposure_compensation: true
+  exposure_start_iter: 500
+  exposure_end_iter: 45000
+  exposure_matrix_reg_weight: 0.001
+  exposure_bias_reg_weight: 0.001
+  exposure_max_gain: 1.5
+  exposure_max_bias: 0.2

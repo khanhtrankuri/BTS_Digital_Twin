@@ -20,6 +20,7 @@ from utils.geometry_losses import (
     normal_consistency_loss,
     scale_shift_invariant_depth_loss,
 )
+from utils.training_schedules import get_stage_loss_weights, exposure_regularization
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -128,7 +129,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
-                            separate_sh=SPARSE_ADAM_AVAILABLE, render_geometry=opt.geometry_aware)
+                            separate_sh=SPARSE_ADAM_AVAILABLE, render_geometry=opt.geometry_aware,
+                            apply_exposure=opt.exposure_compensation and opt.exposure_start_iter <= iteration <= opt.exposure_end_iter)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         if viewpoint_cam.alpha_mask is not None:
@@ -143,8 +145,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             ssim_value = ssim(image, gt_image)
 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
-        loss_terms = {"rgb": Ll1, "l1": Ll1, "ssim": 1.0 - ssim_value}
+        stage_weights = get_stage_loss_weights(iteration, opt)
+        mse_value = torch.nn.functional.mse_loss(image, gt_image)
+        loss = stage_weights["l1"] * Ll1 + stage_weights["mse"] * mse_value + stage_weights["dssim"] * (1.0 - ssim_value)
+        loss_terms = {"rgb": Ll1, "l1": Ll1, "mse": mse_value, "dssim": 1.0 - ssim_value}
         geometry_weights = get_loss_weights(iteration, opt)
         confidence = viewpoint_cam.confidence_map
         if confidence is not None and opt.depth_confidence_weighted:
@@ -153,24 +157,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if geometry_weights["depth"] and viewpoint_cam.depth_prior is not None:
             depth_loss = scale_shift_invariant_depth_loss(render_pkg["depth"], viewpoint_cam.depth_prior,
                                                           confidence=confidence, valid_mask=alpha_valid)
-            loss += geometry_weights["depth"] * depth_loss
+            loss += stage_weights["geometry"] * geometry_weights["depth"] * depth_loss
             loss_terms["depth"] = depth_loss
         if geometry_weights["normal"] and viewpoint_cam.normal_prior is not None:
             normal_loss = normal_consistency_loss(render_pkg["normal"], viewpoint_cam.normal_prior,
                                                    confidence=confidence, valid_mask=alpha_valid,
                                                    use_abs_cosine=opt.normal_use_abs_cosine)
-            loss += geometry_weights["normal"] * normal_loss
+            loss += stage_weights["geometry"] * geometry_weights["normal"] * normal_loss
             loss_terms["normal"] = normal_loss
         edge_map = viewpoint_cam.edge_map
         if edge_map is not None and geometry_weights["edge"]:
             edge_loss = edge_weighted_l1_loss(image, gt_image, edge_map, opt.edge_weight_gamma)
-            loss += geometry_weights["edge"] * edge_loss
+            loss += stage_weights["edge"] * geometry_weights["edge"] * edge_loss
             loss_terms["edge"] = edge_loss
         if geometry_weights["scale"]:
             scale_loss = gaussian_scale_regularization(gaussians.get_scaling, opt.max_gaussian_scale,
                                                        opt.max_anisotropy_ratio)
-            loss += geometry_weights["scale"] * scale_loss
+            loss += stage_weights["geometry"] * geometry_weights["scale"] * scale_loss
             loss_terms["scale"] = scale_loss
+        if opt.exposure_compensation and opt.exposure_start_iter <= iteration <= opt.exposure_end_iter:
+            exposure_loss = exposure_regularization(gaussians.get_exposure, opt.exposure_matrix_reg_weight,
+                                                    opt.exposure_bias_reg_weight)
+            loss += stage_weights["exposure"] * exposure_loss
+            loss_terms["exposure"] = exposure_loss
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -251,6 +260,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.exposure_optimizer.step()
+                if opt.exposure_compensation:
+                    with torch.no_grad():
+                        eye = torch.eye(3, device=gaussians._exposure.device)[None]
+                        delta = (gaussians._exposure[:, :3, :3] - eye).clamp(-(opt.exposure_max_gain - 1.0), opt.exposure_max_gain - 1.0)
+                        gaussians._exposure[:, :3, :3].copy_(eye + delta)
+                        gaussians._exposure[:, :3, 3].clamp_(-opt.exposure_max_bias, opt.exposure_max_bias)
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
                     visible = radii > 0
