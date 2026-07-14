@@ -1,0 +1,19 @@
+OPTIMIZATION:
+  iterations: 45000
+  geometry_aware: false
+  densification_method: original
+EXPOSURE:
+  ENABLED: true
+  MODE: diagonal_gain_bias
+  START_ITER: 500
+  END_ITER: 30000
+  FREEZE_ITER: 30000
+  LR_INIT: 0.001
+  LR_FINAL: 0.0001
+  MIN_GAIN: 0.75
+  MAX_GAIN: 1.25
+  MAX_BIAS: 0.10
+  GAIN_REG_WEIGHT: 0.001
+  BIAS_REG_WEIGHT: 0.001
+  ZERO_MEAN_REG_WEIGHT: 0.001
+  TEST_MODE: identity

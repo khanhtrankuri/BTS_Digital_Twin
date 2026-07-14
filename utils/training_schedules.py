@@ -25,10 +25,3 @@ def get_lr_multipliers(iteration, cfg):
         prefix = "lr_stage_c"
     return {key: float(getattr(cfg, f"{prefix}_{key}")) for key in
             ("xyz", "scaling", "rotation", "features", "opacity", "exposure")}
-
-
-def exposure_regularization(exposure, matrix_weight, bias_weight):
-    identity = exposure.new_zeros(exposure.shape)
-    identity[:, :3, :3] = torch_eye = exposure.new_tensor([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]])
-    return (matrix_weight * (exposure[:, :3, :3] - torch_eye).square().mean() +
-            bias_weight * exposure[:, :3, 3].square().mean())

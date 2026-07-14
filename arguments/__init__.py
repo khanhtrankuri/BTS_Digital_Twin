@@ -43,6 +43,16 @@ def load_bts_geogs_config(path):
         ("DENSIFICATION", "GRADIENT_WEIGHT"): "densification_gradient_weight",
         ("DENSIFICATION", "RESIDUAL_WEIGHT"): "densification_residual_weight",
         ("DENSIFICATION", "EDGE_WEIGHT"): "densification_edge_weight",
+        ("DENSIFICATION", "METHOD"): "densification_method",
+        ("DENSIFICATION", "ORIGINAL_GRAD_WEIGHT"): "densification_original_grad_weight",
+        ("DENSIFICATION", "ABS_GRAD_WEIGHT"): "densification_abs_grad_weight",
+        ("DENSIFICATION", "ABS_GRAD_THRESHOLD"): "densification_abs_grad_threshold",
+        ("DENSIFICATION", "RESIDUAL_TYPE"): "densification_residual_type",
+        ("DENSIFICATION", "SELECTION_MODE"): "densification_selection_mode",
+        ("DENSIFICATION", "PERCENTILE"): "densification_percentile",
+        ("DENSIFICATION", "SCORE_THRESHOLD"): "densification_score_threshold",
+        ("DENSIFICATION", "MIN_VISIBILITY_COUNT"): "densification_min_visibility_count",
+        ("DENSIFICATION", "MAX_NEW_GAUSSIANS_PER_STEP"): "max_new_gaussians_per_step",
         ("DENSIFICATION", "FROM_ITER"): "densify_from_iter",
         ("DENSIFICATION", "UNTIL_ITER"): "densify_until_iter",
         ("DENSIFICATION", "INTERVAL"): "densification_interval",
@@ -61,6 +71,20 @@ def load_bts_geogs_config(path):
         ("INITIALIZATION", "KNN_K"): "dense_prior_knn_k",
         ("INITIALIZATION", "INITIALIZE_ROTATION_FROM_NORMAL"): "initialize_rotation_from_normal",
         ("INITIALIZATION", "INITIALIZE_OPACITY_FROM_CONFIDENCE"): "initialize_opacity_from_confidence",
+        ("EXPOSURE", "ENABLED"): "exposure_compensation",
+        ("EXPOSURE", "MODE"): "exposure_mode",
+        ("EXPOSURE", "START_ITER"): "exposure_start_iter",
+        ("EXPOSURE", "END_ITER"): "exposure_end_iter",
+        ("EXPOSURE", "FREEZE_ITER"): "exposure_freeze_iter",
+        ("EXPOSURE", "LR_INIT"): "exposure_lr_init",
+        ("EXPOSURE", "LR_FINAL"): "exposure_lr_final",
+        ("EXPOSURE", "MIN_GAIN"): "exposure_min_gain",
+        ("EXPOSURE", "MAX_GAIN"): "exposure_max_gain",
+        ("EXPOSURE", "MAX_BIAS"): "exposure_max_bias",
+        ("EXPOSURE", "GAIN_REG_WEIGHT"): "exposure_gain_reg_weight",
+        ("EXPOSURE", "BIAS_REG_WEIGHT"): "exposure_bias_reg_weight",
+        ("EXPOSURE", "ZERO_MEAN_REG_WEIGHT"): "exposure_zero_mean_reg_weight",
+        ("EXPOSURE", "TEST_MODE"): "test_exposure_mode",
     }
     defaults = dict(config.get("OPTIMIZATION", {}))
     defaults.update(config.get("PIPELINE", {}))
@@ -203,12 +227,17 @@ class OptimizationParams(ParamGroup):
         self.initialize_opacity_from_confidence = False
         # BTS-GeoGS-v2 appearance and staged metric optimization (all opt-in).
         self.exposure_compensation = False
+        self.exposure_mode = "diagonal_gain_bias"
         self.exposure_start_iter = 500
         self.exposure_end_iter = 30_000
+        self.exposure_freeze_iter = 30_000
         self.exposure_matrix_reg_weight = 0.001
+        self.exposure_gain_reg_weight = 0.001
         self.exposure_bias_reg_weight = 0.001
-        self.exposure_max_gain = 1.5
-        self.exposure_max_bias = 0.2
+        self.exposure_zero_mean_reg_weight = 0.001
+        self.exposure_min_gain = 0.75
+        self.exposure_max_gain = 1.25
+        self.exposure_max_bias = 0.10
         self.test_exposure_mode = "identity"
         self.loss_schedule_enabled = False
         self.loss_stage_a_end = 12_000
@@ -230,6 +259,12 @@ class OptimizationParams(ParamGroup):
         self.densification_abs_grad_weight = 1.0
         self.densification_original_grad_weight = 0.5
         self.densification_abs_grad_threshold = 0.0008
+        self.densification_residual_type = "charbonnier"
+        self.densification_selection_mode = "threshold"
+        self.densification_percentile = 0.95
+        self.densification_score_threshold = 1.0
+        self.densification_min_visibility_count = 3
+        self.max_new_gaussians_per_step = 100_000
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

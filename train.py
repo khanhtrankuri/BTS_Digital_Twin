@@ -20,7 +20,8 @@ from utils.geometry_losses import (
     normal_consistency_loss,
     scale_shift_invariant_depth_loss,
 )
-from utils.training_schedules import get_stage_loss_weights, exposure_regularization
+from utils.training_schedules import get_stage_loss_weights
+from utils.densification_utils import corrected_residual_map
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -130,12 +131,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
                             separate_sh=SPARSE_ADAM_AVAILABLE, render_geometry=opt.geometry_aware,
-                            apply_exposure=opt.exposure_compensation and opt.exposure_start_iter <= iteration <= opt.exposure_end_iter)
+                            apply_exposure=opt.exposure_compensation and iteration >= opt.exposure_start_iter,
+                            exposure_mode="training")
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        canonical_image = render_pkg["canonical_render"]
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
-            image *= alpha_mask
+            image = image * alpha_mask
+            canonical_image = canonical_image * alpha_mask
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -175,9 +179,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                                                        opt.max_anisotropy_ratio)
             loss += stage_weights["geometry"] * geometry_weights["scale"] * scale_loss
             loss_terms["scale"] = scale_loss
-        if opt.exposure_compensation and opt.exposure_start_iter <= iteration <= opt.exposure_end_iter:
-            exposure_loss = exposure_regularization(gaussians.get_exposure, opt.exposure_matrix_reg_weight,
-                                                    opt.exposure_bias_reg_weight)
+        if opt.exposure_compensation and iteration >= opt.exposure_start_iter:
+            exposure_loss = gaussians.exposure_regularization(
+                opt.exposure_gain_reg_weight, opt.exposure_bias_reg_weight,
+                opt.exposure_zero_mean_reg_weight)
             loss += stage_weights["exposure"] * exposure_loss
             loss_terms["exposure"] = exposure_loss
 
@@ -211,7 +216,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background, 1., SPARSE_ADAM_AVAILABLE, None, dataset.train_test_exp), dataset.train_test_exp, psnr_max)
+            training_report(tb_writer, iteration, Ll1, loss, iter_start.elapsed_time(iter_end),
+                            testing_iterations, scene, pipe, background, SPARSE_ADAM_AVAILABLE,
+                            dataset.train_test_exp, psnr_max, opt)
             if tb_writer:
                 for name, value in loss_terms.items():
                     tb_writer.add_scalar(f"loss/{name}", value.item(), iteration)
@@ -220,6 +227,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar("gaussians/mean_opacity", gaussians.get_opacity.mean().item(), iteration)
                 tb_writer.add_scalar("gaussians/mean_scale", gaussians.get_scaling.mean().item(), iteration)
                 tb_writer.add_scalar("gaussians/max_scale", gaussians.get_scaling.max().item(), iteration)
+                if gaussians.visibility_count.numel():
+                    tb_writer.add_scalar("gaussians/visibility_mean", gaussians.visibility_count.float().mean().item(), iteration)
+                if opt.exposure_compensation and gaussians.exposure_model is not None:
+                    gains, biases = gaussians.exposure_model.gains(), gaussians.exposure_model.biases()
+                    for channel, name in enumerate(("r", "g", "b")):
+                        tb_writer.add_scalar(f"exposure/gain_mean_{name}", gains[:, channel].mean().item(), iteration)
+                    tb_writer.add_scalar("exposure/gain_min", gains.min().item(), iteration)
+                    tb_writer.add_scalar("exposure/gain_max", gains.max().item(), iteration)
+                    tb_writer.add_scalar("exposure/bias_mean", biases.mean().item(), iteration)
+                    tb_writer.add_scalar("exposure/bias_abs_max", biases.abs().max().item(), iteration)
+                    tb_writer.add_scalar("exposure/regularization", loss_terms.get("exposure", image.new_zeros(())).item(), iteration)
+                    tb_writer.add_scalar("exposure/out_of_range_fraction", gaussians.exposure_out_of_range_fraction(image).item(), iteration)
+                    if iteration % 100 == 0:
+                        tb_writer.add_images("render/canonical", canonical_image.clamp(0, 1)[None], iteration)
+                        tb_writer.add_images("render/corrected", image.clamp(0, 1)[None], iteration)
+                        tb_writer.add_images("gt", gt_image[None], iteration)
+                        tb_writer.add_images("error/canonical", (canonical_image.detach() - gt_image).abs().clamp(0, 1)[None], iteration)
+                        tb_writer.add_images("error/corrected", (image.detach() - gt_image).abs().clamp(0, 1)[None], iteration)
                 if opt.geometry_aware and iteration % 100 == 0:
                     tb_writer.add_images("render/depth", render_pkg["depth"].clamp_min(0)[None], iteration)
                     tb_writer.add_images("render/normal", ((render_pkg["normal"] + 1) * 0.5).clamp(0, 1)[None], iteration)
@@ -234,16 +259,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-                if opt.geometry_aware:
-                    residual_map = (image.detach() - gt_image.detach()).abs().mean(dim=0)
+                if gaussians.densification_stats_enabled:
+                    residual_map = corrected_residual_map(image, gt_image, opt.densification_residual_type)
                     if edge_map is None:
-                        edge_map = torch.zeros_like(residual_map).unsqueeze(0)
+                        edge_map = torch.zeros_like(residual_map)
                     gaussians.accumulate_geometry_stats(viewpoint_cam, visibility_filter, residual_map, edge_map, radii)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    if opt.geometry_aware:
+                    if gaussians.densification_stats_enabled:
                         gaussians.densify_and_prune_geometry(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, opt)
+                        if tb_writer:
+                            for name, value in gaussians._last_densification_metrics.items():
+                                tb_writer.add_scalar(f"densification/{name}", value, iteration)
+                            for name, value in gaussians._last_densify_counts.items():
+                                tb_writer.add_scalar(f"densification/{name}_count", value, iteration)
                     else:
                         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                 
@@ -259,13 +289,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Optimizer step
             if iteration < opt.iterations:
-                gaussians.exposure_optimizer.step()
-                if opt.exposure_compensation:
-                    with torch.no_grad():
-                        eye = torch.eye(3, device=gaussians._exposure.device)[None]
-                        delta = (gaussians._exposure[:, :3, :3] - eye).clamp(-(opt.exposure_max_gain - 1.0), opt.exposure_max_gain - 1.0)
-                        gaussians._exposure[:, :3, :3].copy_(eye + delta)
-                        gaussians._exposure[:, :3, 3].clamp_(-opt.exposure_max_bias, opt.exposure_max_bias)
+                if (opt.exposure_compensation and opt.exposure_start_iter <= iteration <= opt.exposure_end_iter
+                        and iteration <= opt.exposure_freeze_iter):
+                    gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none = True)
                 if use_sparse_adam:
                     visible = radii > 0
@@ -301,7 +327,8 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, train_test_exp, psnr_max):
+def training_report(tb_writer, iteration, Ll1, loss, elapsed, testing_iterations, scene : Scene,
+                    pipe, background, separate_sh, train_test_exp, psnr_max, opt):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -317,25 +344,47 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 metric_values = []
+                canonical_metric_values = []
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    is_train = config['name'] == 'train'
+                    use_v3_exposure = bool(opt.exposure_compensation)
+                    exposure_mode = "training" if is_train else opt.test_exposure_mode
+                    package = render(
+                        viewpoint, scene.gaussians, pipe, background,
+                        use_trained_exp=train_test_exp, separate_sh=separate_sh,
+                        apply_exposure=use_v3_exposure, exposure_mode=exposure_mode)
+                    canonical_image = torch.clamp(package["canonical_render"], 0.0, 1.0)
+                    image = torch.clamp(package["corrected_render"] if use_v3_exposure else package["render"], 0.0, 1.0)
                     if not getattr(viewpoint, "has_ground_truth", True):
                         continue
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if train_test_exp:
                         image = image[..., image.shape[-1] // 2:]
+                        canonical_image = canonical_image[..., canonical_image.shape[-1] // 2:]
                         gt_image = gt_image[..., gt_image.shape[-1] // 2:]
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     metric_values.append(calculate_render_metrics(image, gt_image, psnr_max, lpips_model))
+                    if is_train:
+                        canonical_metric_values.append(calculate_render_metrics(
+                            canonical_image, gt_image, psnr_max, lpips_model))
                 metrics = average_metric_dicts(metric_values)
                 print_metric_block(iteration, f"{config['name']} ({scene.model_path})", metrics)
+                canonical_metrics = average_metric_dicts(canonical_metric_values)
+                if canonical_metrics is not None:
+                    print_metric_block(iteration, f"{config['name']} canonical ({scene.model_path})", canonical_metrics)
                 if tb_writer and metrics is not None:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', metrics["l1"], iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', metrics["psnr"], iteration)
                     write_tensorboard_metrics(tb_writer, config['name'], iteration, metrics)
+                    if is_train:
+                        tb_writer.add_scalar("eval/train_corrected_psnr", metrics["psnr"].item(), iteration)
+                        tb_writer.add_scalar("eval/train_corrected_ssim", metrics["ssim"].item(), iteration)
+                if tb_writer and canonical_metrics is not None:
+                    tb_writer.add_scalar("eval/train_canonical_psnr", canonical_metrics["psnr"].item(), iteration)
+                    tb_writer.add_scalar("eval/train_canonical_ssim", canonical_metrics["ssim"].item(), iteration)
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)

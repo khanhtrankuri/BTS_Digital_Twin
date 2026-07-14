@@ -58,7 +58,8 @@ def make_pipeline_args():
     )
 
 
-def render_scene(scene_path, model_path, iteration, resolution, output_dir):
+def render_scene(scene_path, model_path, iteration, resolution, output_dir,
+                 exposure_compensation=False, test_exposure_mode="identity"):
     dataset = make_dataset_args(scene_path, model_path, resolution)
     pipeline = make_pipeline_args()
     scene_output = Path(output_dir) / scene_path.name
@@ -79,6 +80,8 @@ def render_scene(scene_path, model_path, iteration, resolution, output_dir):
                     background,
                     use_trained_exp=dataset.train_test_exp,
                     separate_sh=SPARSE_ADAM_AVAILABLE,
+                    apply_exposure=exposure_compensation,
+                    exposure_mode=test_exposure_mode,
                 )["render"],
                 0.0,
                 1.0,
@@ -105,6 +108,8 @@ def main():
     parser.add_argument("--output_dir", default="submission")
     parser.add_argument("--zip_path", default="submission.zip")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--exposure_compensation", action="store_true")
+    parser.add_argument("--test_exposure_mode", choices=["identity", "nearest_camera", "weighted_nearest"], default="identity")
     args = parser.parse_args()
 
     safe_state(args.quiet)
@@ -117,7 +122,8 @@ def main():
         if not model_path.exists():
             print(f"Skip {scene_path.name}: model folder not found at {model_path}")
             continue
-        render_scene(scene_path, model_path, args.iteration, args.resolution, args.output_dir)
+        render_scene(scene_path, model_path, args.iteration, args.resolution, args.output_dir,
+                     args.exposure_compensation, args.test_exposure_mode)
 
     zip_submission(args.output_dir, args.zip_path)
     print(f"Saved submission zip to {args.zip_path}")

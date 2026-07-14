@@ -63,7 +63,8 @@ def make_pipeline_args():
     )
 
 
-def evaluate_scene(scene_path, model_path, iteration, resolution, psnr_max):
+def evaluate_scene(scene_path, model_path, iteration, resolution, psnr_max,
+                   exposure_compensation=False, test_exposure_mode="identity"):
     dataset = make_dataset_args(scene_path, model_path, resolution)
     pipeline = make_pipeline_args()
 
@@ -86,6 +87,8 @@ def evaluate_scene(scene_path, model_path, iteration, resolution, psnr_max):
                     background,
                     use_trained_exp=dataset.train_test_exp,
                     separate_sh=SPARSE_ADAM_AVAILABLE,
+                    apply_exposure=exposure_compensation,
+                    exposure_mode=test_exposure_mode,
                 )["render"],
                 0.0,
                 1.0,
@@ -104,6 +107,8 @@ def main():
     parser.add_argument("--resolution", type=int, default=1)
     parser.add_argument("--psnr_max", type=float, default=30.0)
     parser.add_argument("--csv_path", default="metrics_public.csv")
+    parser.add_argument("--exposure_compensation", action="store_true")
+    parser.add_argument("--test_exposure_mode", choices=["identity", "nearest_camera", "weighted_nearest"], default="identity")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
@@ -118,7 +123,8 @@ def main():
         if not model_path.exists():
             print(f"Skip {scene_path.name}: model folder not found at {model_path}")
             continue
-        metrics = evaluate_scene(scene_path, model_path, args.iteration, args.resolution, args.psnr_max)
+        metrics = evaluate_scene(scene_path, model_path, args.iteration, args.resolution, args.psnr_max,
+                                 args.exposure_compensation, args.test_exposure_mode)
         if metrics is None:
             print(f"{scene_path.name}: Ground-truth test images not found, skip metrics for private set.")
             continue

@@ -138,6 +138,8 @@ def main():
     parser.add_argument("--test_csv", required=True)
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--skip_existing", action="store_true")
+    parser.add_argument("--exposure_compensation", action="store_true")
+    parser.add_argument("--test_exposure_mode", choices=["identity", "nearest_camera", "weighted_nearest"], default="identity")
 
     args = get_combined_args(parser)
 
@@ -174,7 +176,9 @@ def main():
                 continue
 
             cam = make_camera_from_csv_row(row, uid=uid, data_device=device)
-            pkg = render(cam, gaussians, pipe, background)
+            pkg = render(cam, gaussians, pipe, background,
+                         apply_exposure=args.exposure_compensation,
+                         exposure_mode=args.test_exposure_mode)
             rendering = pkg["render"].clamp(0.0, 1.0)
 
             torchvision.utils.save_image(rendering, str(out_path))

@@ -40,6 +40,12 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
+        # Camera construction needs these optimization switches to decide
+        # whether edge/geometry priors should be materialized.
+        if optimization_args is not None:
+            for name in ("geometry_aware", "edge_loss_enabled", "densification_edge_aware"):
+                setattr(args, name, getattr(optimization_args, name, False))
+
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
         elif os.path.exists(os.path.join(args.source_path, "train", "sparse")) and os.path.exists(os.path.join(args.source_path, "test", "test_poses.csv")):
@@ -77,11 +83,18 @@ class Scene:
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
 
+        # One exposure implementation is shared by training, checkpointing and
+        # inference. CameraInfo order matches the exposure mapping and Camera uid.
+        self.gaussians.setup_exposure(scene_info.train_cameras, optimization_args)
+
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"), args.train_test_exp)
+            exposure_path = os.path.join(self.model_path, "exposure.json")
+            if self.gaussians.load_exposure_json(exposure_path):
+                print("Pretrained diagonal exposures loaded.")
         else:
             if optimization_args is not None and optimization_args.initialization_mode == "dense_prior":
                 from utils.dense_initialization import load_dense_initialization, voxel_downsample
@@ -100,13 +113,7 @@ class Scene:
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
-        exposure_dict = {
-            image_name: self.gaussians.get_exposure_from_name(image_name).detach().cpu().numpy().tolist()
-            for image_name in self.gaussians.exposure_mapping
-        }
-
-        with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
-            json.dump(exposure_dict, f, indent=2)
+        self.gaussians.save_exposure_json(os.path.join(self.model_path, "exposure.json"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

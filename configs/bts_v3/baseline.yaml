@@ -1,0 +1,8 @@
+OPTIMIZATION:
+  iterations: 45000
+  geometry_aware: false
+  exposure_compensation: false
+  densification_method: original
+  loss_schedule_enabled: false
+PIPELINE:
+  antialiasing: false
