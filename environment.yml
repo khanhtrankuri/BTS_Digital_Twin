@@ -25,6 +25,7 @@ dependencies:
       - opencv-python
       - joblib
       - pyyaml
+      - lpips
 
 # After creating the env from this file, build the local CUDA extensions from
 # the repository root:

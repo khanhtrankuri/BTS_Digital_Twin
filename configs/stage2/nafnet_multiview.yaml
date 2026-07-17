@@ -1,0 +1,7 @@
+_BASE_: nafnet_base.yaml
+# Warp primitives are implemented and tested, but paired-camera sampling remains
+# intentionally disabled until pose/depth conventions are validated per dataset.
+MULTIVIEW:
+  ENABLED: false
+  WEIGHT: 0.01
+  DEPTH_CONSISTENCY_THRESHOLD: 0.02

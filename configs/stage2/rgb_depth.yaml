@@ -1,0 +1,5 @@
+_BASE_: nafnet_base.yaml
+MODEL:
+  GEOMETRY_MODE: depth
+LOSS:
+  EDGE_WEIGHT: 0.0
