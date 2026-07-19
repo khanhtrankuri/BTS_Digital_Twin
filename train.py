@@ -11,7 +11,7 @@
 
 import os
 import torch
-from random import randint
+from random import randint, choices
 from utils.loss_utils import l1_loss, ssim
 from utils.geometry_losses import (
     edge_weighted_l1_loss,
@@ -20,7 +20,13 @@ from utils.geometry_losses import (
     normal_consistency_loss,
     scale_shift_invariant_depth_loss,
 )
-from utils.training_schedules import get_stage_loss_weights
+from utils.training_schedules import (
+    get_resolution_stage,
+    get_sh_degree,
+    get_stage_loss_weights,
+    resolution_cache_scales,
+)
+from utils.depth_reprojection import pairwise_depth_consistency
 from utils.densification_utils import corrected_residual_map
 from gaussian_renderer import render, network_gui
 import sys
@@ -64,7 +70,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians, optimization_args=opt)
+    scene = Scene(dataset, gaussians, resolution_scales=resolution_cache_scales(opt), optimization_args=opt)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
@@ -79,12 +85,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     use_sparse_adam = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE 
     depth_l1_weight = get_expon_lr_func(opt.depth_l1_weight_init, opt.depth_l1_weight_final, max_steps=opt.iterations)
     if opt.geometry_aware:
-        if opt.depth_loss_enabled and not any(cam.depth_prior is not None for cam in scene.getTrainCameras()):
+        diagnostic_cameras = next(iter(scene.train_cameras.values()))
+        if opt.depth_loss_enabled and not any(cam.depth_prior is not None for cam in diagnostic_cameras):
             print("[BTS-GeoGS] Depth loss requested but no depth prior was loaded; skipping it.")
-        if opt.normal_loss_enabled and not any(cam.normal_prior is not None for cam in scene.getTrainCameras()):
+        if opt.normal_loss_enabled and not any(cam.normal_prior is not None for cam in diagnostic_cameras):
             print("[BTS-GeoGS] Normal loss requested but no normal prior was loaded; skipping it.")
 
-    viewpoint_stack = scene.getTrainCameras().copy()
+    resolution_stage, image_scale = get_resolution_stage(first_iter, opt)
+    resolution_key = 1.0 / image_scale
+    viewpoint_stack = scene.getTrainCameras(resolution_key).copy()
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
@@ -111,15 +120,39 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         gaussians.update_learning_rate(iteration)
 
-        # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 1000 == 0:
-            gaussians.oneupSHdegree()
+        scheduled_degree = get_sh_degree(iteration, opt, gaussians.max_sh_degree)
+        if scheduled_degree is None:
+            # Historic behavior remains exact when the schedule is disabled.
+            if iteration % 1000 == 0:
+                gaussians.oneupSHdegree()
+        else:
+            gaussians.active_sh_degree = scheduled_degree
+
+        next_stage, next_image_scale = get_resolution_stage(iteration, opt)
+        if next_stage != resolution_stage:
+            resolution_stage, image_scale = next_stage, next_image_scale
+            resolution_key = 1.0 / image_scale
+            viewpoint_stack = scene.getTrainCameras(resolution_key).copy()
+            viewpoint_indices = list(range(len(viewpoint_stack)))
+            gaussians.reset_image_space_statistics()
+            print(f"[BTS-GeoGS] Resolution transition: stage={resolution_stage}, scale={image_scale:.3f}")
+            if tb_writer:
+                tb_writer.add_scalar("schedule/resolution_scale", image_scale, iteration)
 
         # Pick a random Camera
         if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_stack = scene.getTrainCameras(resolution_key).copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
+        if opt.sharpness_aware_sampling:
+            sample_weights = [
+                opt.sharpness_min_sample_weight
+                + (opt.sharpness_max_sample_weight - opt.sharpness_min_sample_weight)
+                * viewpoint_stack[index].normalized_sharpness
+                for index in range(len(viewpoint_stack))
+            ]
+            rand_idx = choices(range(len(viewpoint_indices)), weights=sample_weights, k=1)[0]
+        else:
+            rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
         vind = viewpoint_indices.pop(rand_idx)
 
@@ -130,7 +163,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp,
-                            separate_sh=SPARSE_ADAM_AVAILABLE, render_geometry=opt.geometry_aware,
+                            separate_sh=SPARSE_ADAM_AVAILABLE,
+                            render_geometry=(opt.geometry_aware or opt.multiview_depth_enabled),
                             apply_exposure=opt.exposure_compensation and iteration >= opt.exposure_start_iter,
                             exposure_mode="training")
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -143,7 +177,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
+        sky_mask = (viewpoint_cam.sky_mask.to(image.device, non_blocking=True)
+                    if viewpoint_cam.sky_mask is not None else None)
+        low_parallax_mask = (viewpoint_cam.low_parallax_mask.to(image.device, non_blocking=True)
+                             if viewpoint_cam.low_parallax_mask is not None else None)
         Ll1 = l1_loss(image, gt_image)
+        photometric_weight = torch.ones_like(gt_image[:1])
+        if opt.sky_enabled and sky_mask is not None:
+            photometric_weight = torch.where(
+                sky_mask > 0.5,
+                photometric_weight.new_tensor(float(opt.sky_photometric_weight)), photometric_weight)
+        difference = image - gt_image
+        if opt.use_charbonnier:
+            reconstruction_map = torch.sqrt(difference.square() + float(opt.charbonnier_eps) ** 2).mean(dim=0, keepdim=True)
+        else:
+            reconstruction_map = difference.abs().mean(dim=0, keepdim=True)
+        reconstruction_loss = (photometric_weight * reconstruction_map).sum() / photometric_weight.sum().clamp_min(1e-6)
         if FUSED_SSIM_AVAILABLE:
             ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         else:
@@ -151,25 +200,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         stage_weights = get_stage_loss_weights(iteration, opt)
         mse_value = torch.nn.functional.mse_loss(image, gt_image)
-        loss = stage_weights["l1"] * Ll1 + stage_weights["mse"] * mse_value + stage_weights["dssim"] * (1.0 - ssim_value)
+        loss = stage_weights["l1"] * reconstruction_loss + stage_weights["mse"] * mse_value + stage_weights["dssim"] * (1.0 - ssim_value)
         loss_terms = {"rgb": Ll1, "l1": Ll1, "mse": mse_value, "dssim": 1.0 - ssim_value}
         geometry_weights = get_loss_weights(iteration, opt)
-        confidence = viewpoint_cam.confidence_map
+        confidence = (viewpoint_cam.confidence_map.to(image.device, non_blocking=True)
+                      if viewpoint_cam.confidence_map is not None else None)
         if confidence is not None and opt.depth_confidence_weighted:
             confidence = torch.where(confidence >= opt.depth_min_confidence, confidence, torch.zeros_like(confidence))
         alpha_valid = render_pkg["alpha"] > 1e-6 if render_pkg["alpha"] is not None else None
+        geometry_valid = alpha_valid
+        if geometry_valid is not None and opt.sky_enabled and sky_mask is not None:
+            geometry_valid = geometry_valid & (sky_mask < 0.5)
+        geometry_confidence = confidence
+        if opt.low_parallax_enabled and low_parallax_mask is not None:
+            low_weight = torch.where(
+                low_parallax_mask > 0.5,
+                low_parallax_mask.new_tensor(float(opt.low_parallax_geometry_weight)),
+                torch.ones_like(low_parallax_mask))
+            geometry_confidence = low_weight if geometry_confidence is None else geometry_confidence * low_weight
         if geometry_weights["depth"] and viewpoint_cam.depth_prior is not None:
-            depth_loss = scale_shift_invariant_depth_loss(render_pkg["depth"], viewpoint_cam.depth_prior,
-                                                          confidence=confidence, valid_mask=alpha_valid)
+            depth_prior = viewpoint_cam.depth_prior.to(image.device, non_blocking=True)
+            depth_loss = scale_shift_invariant_depth_loss(render_pkg["depth"], depth_prior,
+                                                          confidence=geometry_confidence, valid_mask=geometry_valid)
             loss += stage_weights["geometry"] * geometry_weights["depth"] * depth_loss
             loss_terms["depth"] = depth_loss
         if geometry_weights["normal"] and viewpoint_cam.normal_prior is not None:
-            normal_loss = normal_consistency_loss(render_pkg["normal"], viewpoint_cam.normal_prior,
-                                                   confidence=confidence, valid_mask=alpha_valid,
+            normal_prior = viewpoint_cam.normal_prior.to(image.device, non_blocking=True)
+            normal_loss = normal_consistency_loss(render_pkg["normal"], normal_prior,
+                                                   confidence=geometry_confidence, valid_mask=geometry_valid,
                                                    use_abs_cosine=opt.normal_use_abs_cosine)
             loss += stage_weights["geometry"] * geometry_weights["normal"] * normal_loss
             loss_terms["normal"] = normal_loss
         edge_map = viewpoint_cam.edge_map
+        if edge_map is not None:
+            edge_map = edge_map.to(image.device, non_blocking=True)
+        if edge_map is not None and opt.sky_enabled and sky_mask is not None:
+            edge_map = edge_map * torch.where(
+                sky_mask > 0.5, edge_map.new_tensor(float(opt.sky_edge_weight)), 1.0)
+        if edge_map is not None and viewpoint_cam.local_sharpness is not None:
+            local_sharpness = viewpoint_cam.local_sharpness.to(image.device, non_blocking=True)
+            blur_weight = float(opt.blur_edge_weight_min) + (1.0 - float(opt.blur_edge_weight_min)) * local_sharpness
+            edge_map = edge_map * blur_weight
         if edge_map is not None and geometry_weights["edge"]:
             edge_loss = edge_weighted_l1_loss(image, gt_image, edge_map, opt.edge_weight_gamma)
             loss += stage_weights["edge"] * geometry_weights["edge"] * edge_loss
@@ -185,6 +256,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 opt.exposure_zero_mean_reg_weight)
             loss += stage_weights["exposure"] * exposure_loss
             loss_terms["exposure"] = exposure_loss
+
+        depth_confidence_map = None
+        if (opt.multiview_depth_enabled and render_pkg["depth"] is not None
+                and iteration % max(1, int(opt.multiview_depth_interval)) == 0
+                and len(scene.getTrainCameras(resolution_key)) > 1):
+            candidates = [camera for camera in scene.getTrainCameras(resolution_key) if camera.image_name != viewpoint_cam.image_name]
+            source_camera = min(candidates, key=lambda camera: float(torch.linalg.vector_norm(
+                camera.camera_center - viewpoint_cam.camera_center).item()))
+            with torch.no_grad():
+                source_package = render(
+                    source_camera, gaussians, pipe, bg, separate_sh=SPARSE_ADAM_AVAILABLE,
+                    render_geometry=True, apply_exposure=False)
+            consistency = pairwise_depth_consistency(
+                render_pkg["depth"], source_package["depth"], viewpoint_cam, source_camera,
+                target_alpha=render_pkg["alpha"], source_alpha=source_package["alpha"],
+                sky_mask=sky_mask, sigma_z=opt.multiview_depth_sigma,
+                relative_threshold=opt.multiview_depth_relative_threshold)
+            depth_confidence_map = consistency.soft_confidence.detach()
+            detached_confidence = consistency.soft_confidence.detach()
+            valid_confidence = detached_confidence.sum()
+            if valid_confidence > 0:
+                multiview_depth_loss = (
+                    consistency.relative_error * detached_confidence).sum() / valid_confidence.clamp_min(1e-6)
+                loss = loss + float(opt.multiview_depth_weight) * multiview_depth_loss
+                loss_terms["multiview_depth"] = multiview_depth_loss
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -227,6 +323,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 tb_writer.add_scalar("gaussians/mean_opacity", gaussians.get_opacity.mean().item(), iteration)
                 tb_writer.add_scalar("gaussians/mean_scale", gaussians.get_scaling.mean().item(), iteration)
                 tb_writer.add_scalar("gaussians/max_scale", gaussians.get_scaling.max().item(), iteration)
+                tb_writer.add_scalar("schedule/active_sh_degree", gaussians.active_sh_degree, iteration)
+                tb_writer.add_scalar("schedule/resolution_scale", image_scale, iteration)
+                tb_writer.add_scalar("image_quality/sharpness", viewpoint_cam.sharpness, iteration)
                 if gaussians.visibility_count.numel():
                     tb_writer.add_scalar("gaussians/visibility_mean", gaussians.visibility_count.float().mean().item(), iteration)
                 if opt.exposure_compensation and gaussians.exposure_model is not None:
@@ -248,6 +347,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if opt.geometry_aware and iteration % 100 == 0:
                     tb_writer.add_images("render/depth", render_pkg["depth"].clamp_min(0)[None], iteration)
                     tb_writer.add_images("render/normal", ((render_pkg["normal"] + 1) * 0.5).clamp(0, 1)[None], iteration)
+                    tb_writer.add_images("render/alpha", render_pkg["alpha"].clamp(0, 1)[None], iteration)
+                    tb_writer.add_images("render/uncertainty", render_pkg["uncertainty"].clamp(0, 1)[None], iteration)
+                    if sky_mask is not None:
+                        tb_writer.add_images("prior/sky", sky_mask[None], iteration)
                     tb_writer.add_images("prior/edge", edge_map[None] if edge_map is not None else torch.zeros_like(render_pkg["depth"])[None], iteration)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -263,17 +366,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     residual_map = corrected_residual_map(image, gt_image, opt.densification_residual_type)
                     if edge_map is None:
                         edge_map = torch.zeros_like(residual_map)
-                    gaussians.accumulate_geometry_stats(viewpoint_cam, visibility_filter, residual_map, edge_map, radii)
+                    gaussians.accumulate_geometry_stats(
+                        viewpoint_cam, visibility_filter, residual_map, edge_map, radii, depth_confidence_map)
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                densification_window = (int(opt.densification_window_size)
+                                        if opt.densification_method == "persistent_multiview_hybrid"
+                                        else int(opt.densification_interval))
+                if iteration > opt.densify_from_iter and iteration % max(1, densification_window) == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     if gaussians.densification_stats_enabled:
-                        gaussians.densify_and_prune_geometry(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii, opt)
+                        gaussians.densify_and_prune_geometry(
+                            opt.densify_grad_threshold, 0.005, scene.cameras_extent,
+                            size_threshold, radii, opt, iteration)
                         if tb_writer:
                             for name, value in gaussians._last_densification_metrics.items():
                                 tb_writer.add_scalar(f"densification/{name}", value, iteration)
                             for name, value in gaussians._last_densify_counts.items():
                                 tb_writer.add_scalar(f"densification/{name}_count", value, iteration)
+                            if gaussians.gradient_burstiness.numel():
+                                tb_writer.add_histogram("densification/burstiness", gaussians.gradient_burstiness, iteration)
+                                tb_writer.add_histogram("densification/unique_view_support", gaussians.unique_view_support.float(), iteration)
+                                tb_writer.add_histogram("densification/persistent_hits", gaussians.window_hit_count.float(), iteration)
                     else:
                         gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
                 
@@ -283,12 +396,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (opt.geometry_aware and opt.importance_pruning_enabled and
                     iteration >= opt.importance_pruning_start_iter and
                     iteration % opt.importance_pruning_interval == 0):
-                pruned = gaussians.prune_low_importance(opt)
+                pruned = gaussians.prune_low_importance(opt, iteration)
                 if pruned:
                     print(f"[BTS-GeoGS] Importance-pruned {pruned} Gaussians at iteration {iteration}.")
 
             # Optimizer step
             if iteration < opt.iterations:
+                if gaussians.background_optimizer is not None:
+                    gaussians.background_optimizer.step()
+                    gaussians.background_optimizer.zero_grad(set_to_none=True)
                 if (opt.exposure_compensation and opt.exposure_start_iter <= iteration <= opt.exposure_end_iter
                         and iteration <= opt.exposure_freeze_iter):
                     gaussians.exposure_optimizer.step()
@@ -318,6 +434,12 @@ def prepare_output_and_logger(args):
     os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
+    config_path = getattr(args, "resolved_config_source", None)
+    if config_path:
+        from utils.config_utils import load_yaml_with_base
+        import yaml
+        with open(os.path.join(args.model_path, "resolved_config.yaml"), "w", encoding="utf-8") as handle:
+            yaml.safe_dump(load_yaml_with_base(config_path), handle, sort_keys=False)
 
     # Create Tensorboard writer
     tb_writer = None
@@ -345,6 +467,7 @@ def training_report(tb_writer, iteration, Ll1, loss, elapsed, testing_iterations
             if config['cameras'] and len(config['cameras']) > 0:
                 metric_values = []
                 canonical_metric_values = []
+                metrics_by_difficulty = {}
                 for idx, viewpoint in enumerate(config['cameras']):
                     is_train = config['name'] == 'train'
                     use_v3_exposure = bool(opt.exposure_compensation)
@@ -353,6 +476,15 @@ def training_report(tb_writer, iteration, Ll1, loss, elapsed, testing_iterations
                         viewpoint, scene.gaussians, pipe, background,
                         use_trained_exp=train_test_exp, separate_sh=separate_sh,
                         apply_exposure=use_v3_exposure, exposure_mode=exposure_mode)
+                    if use_v3_exposure and not is_train and scene.gaussians.last_exposure_diagnostics:
+                        diagnostics = scene.gaussians.last_exposure_diagnostics
+                        source_names = {index: name for name, index in scene.gaussians.exposure_mapping.items()}
+                        selected = [source_names.get(index, str(index)) for index in diagnostics.get("indices", [])]
+                        print(f"[Exposure] target={viewpoint.image_name} sources={selected} "
+                              f"weights={diagnostics.get('weights', [])} "
+                              f"nearest={diagnostics.get('nearest_distance', 0.0):.5f} "
+                              f"confidence={diagnostics.get('confidence', 0.0):.5f} "
+                              f"out_of_range={diagnostics.get('out_of_range_fraction', 0.0):.6f}")
                     canonical_image = torch.clamp(package["canonical_render"], 0.0, 1.0)
                     image = torch.clamp(package["corrected_render"] if use_v3_exposure else package["render"], 0.0, 1.0)
                     if not getattr(viewpoint, "has_ground_truth", True):
@@ -366,7 +498,11 @@ def training_report(tb_writer, iteration, Ll1, loss, elapsed, testing_iterations
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    metric_values.append(calculate_render_metrics(image, gt_image, psnr_max, lpips_model))
+                    view_metrics = calculate_render_metrics(image, gt_image, psnr_max, lpips_model)
+                    metric_values.append(view_metrics)
+                    difficulty = getattr(viewpoint, "difficulty_bin", "")
+                    if difficulty:
+                        metrics_by_difficulty.setdefault(difficulty, []).append(view_metrics)
                     if is_train:
                         canonical_metric_values.append(calculate_render_metrics(
                             canonical_image, gt_image, psnr_max, lpips_model))
@@ -379,9 +515,19 @@ def training_report(tb_writer, iteration, Ll1, loss, elapsed, testing_iterations
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', metrics["l1"], iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', metrics["psnr"], iteration)
                     write_tensorboard_metrics(tb_writer, config['name'], iteration, metrics)
-                    if is_train:
+                    millions = max(scene.gaussians.get_xyz.shape[0] / 1_000_000.0, 1e-6)
+                    tb_writer.add_scalar(config['name'] + '/quality_psnr_per_million_gaussians',
+                                         metrics["psnr"].item() / millions, iteration)
+                    if config['name'] == 'train':
                         tb_writer.add_scalar("eval/train_corrected_psnr", metrics["psnr"].item(), iteration)
                         tb_writer.add_scalar("eval/train_corrected_ssim", metrics["ssim"].item(), iteration)
+                for difficulty, values in sorted(metrics_by_difficulty.items()):
+                    difficulty_metrics = average_metric_dicts(values)
+                    print_metric_block(iteration, f"{config['name']}/{difficulty} ({scene.model_path})",
+                                       difficulty_metrics)
+                    if tb_writer and difficulty_metrics is not None:
+                        write_tensorboard_metrics(tb_writer, f"{config['name']}/difficulty/{difficulty}",
+                                                  iteration, difficulty_metrics)
                 if tb_writer and canonical_metrics is not None:
                     tb_writer.add_scalar("eval/train_canonical_psnr", canonical_metrics["psnr"].item(), iteration)
                     tb_writer.add_scalar("eval/train_canonical_ssim", canonical_metrics["ssim"].item(), iteration)
@@ -409,6 +555,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--psnr_max", type=float, default=30.0)
     parser.add_argument("--config", type=str, default=None, help="Optional BTS-GeoGS YAML preset; explicit CLI flags take precedence.")
+    parser.add_argument("--seed", type=int, default=0)
     config_args, _ = parser.parse_known_args(sys.argv[1:])
     if config_args.config:
         parser.set_defaults(**load_bts_geogs_config(config_args.config))
@@ -418,13 +565,16 @@ if __name__ == "__main__":
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
-    safe_state(args.quiet)
+    safe_state(args.quiet, args.seed)
 
     # Start GUI server, configure and run training
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.psnr_max)
+    dataset_args = lp.extract(args)
+    dataset_args.resolved_config_source = args.config
+    training(dataset_args, op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations,
+             args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.psnr_max)
 
     # All done
     print("\nTraining complete.")

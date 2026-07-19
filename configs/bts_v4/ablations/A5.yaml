@@ -1,0 +1,4 @@
+BASE: A0.yaml
+DENSIFICATION:
+  METHOD: persistent_multiview_hybrid
+

@@ -1,0 +1,4 @@
+BASE: A0.yaml
+SH_SCHEDULE:
+  ENABLED: true
+

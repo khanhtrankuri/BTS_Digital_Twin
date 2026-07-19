@@ -109,7 +109,8 @@ def main():
     parser.add_argument("--zip_path", default="submission.zip")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--exposure_compensation", action="store_true")
-    parser.add_argument("--test_exposure_mode", choices=["identity", "nearest_camera", "weighted_nearest"], default="identity")
+    parser.add_argument("--test_exposure_mode", choices=["identity", "nearest_camera", "weighted_nearest",
+                        "pose_confidence_blend", "temporal_weighted", "pose_temporal_weighted"], default="identity")
     args = parser.parse_args()
 
     safe_state(args.quiet)

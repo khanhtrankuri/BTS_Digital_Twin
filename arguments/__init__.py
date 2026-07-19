@@ -16,12 +16,8 @@ import os
 
 def load_bts_geogs_config(path):
     """Map a readable BTS-GeoGS YAML preset onto the existing argparse API."""
-    try:
-        import yaml
-    except ImportError as error:
-        raise RuntimeError("Using --config requires PyYAML. Install the environment from environment.yml.") from error
-    with open(path, "r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle) or {}
+    from utils.config_utils import load_yaml_with_base
+    config = load_yaml_with_base(path)
     mapping = {
         ("MODEL", "GEOMETRY_AWARE", "ENABLED"): "geometry_aware",
         ("MODEL", "GEOMETRY_AWARE", "DEPTH_LOSS_ENABLED"): "depth_loss_enabled",
@@ -58,12 +54,35 @@ def load_bts_geogs_config(path):
         ("DENSIFICATION", "INTERVAL"): "densification_interval",
         ("DENSIFICATION", "MAX_GAUSSIANS"): "max_gaussians",
         ("DENSIFICATION", "MIN_GAUSSIAN_AGE"): "min_gaussian_age",
+        ("DENSIFICATION", "WINDOW_SIZE"): "densification_window_size",
+        ("DENSIFICATION", "PERSISTENCE_DECAY"): "densification_persistence_decay",
+        ("DENSIFICATION", "MIN_PERSISTENT_WINDOWS"): "densification_min_persistent_windows",
+        ("DENSIFICATION", "PERSISTENT_THRESHOLD"): "densification_persistent_threshold",
+        ("DENSIFICATION", "RECENT_WINDOW_COUNT"): "densification_recent_window_count",
+        ("DENSIFICATION", "MIN_RECENT_HITS"): "densification_min_recent_hits",
+        ("DENSIFICATION", "UNIQUE_VIEW_SUPPORT_ENABLED"): "densification_unique_view_support_enabled",
+        ("DENSIFICATION", "UNIQUE_VIEW_BINS"): "densification_unique_view_bins",
+        ("DENSIFICATION", "MIN_UNIQUE_VIEW_BINS"): "densification_min_unique_view_bins",
+        ("DENSIFICATION", "MULTIVIEW_WEIGHT"): "densification_multiview_weight",
+        ("DENSIFICATION", "DEPTH_SUPPORT_WEIGHT"): "densification_depth_support_weight",
+        ("DENSIFICATION", "REQUIRE_DEPTH_CONSISTENCY"): "densification_require_depth_consistency",
+        ("DENSIFICATION", "MIN_DEPTH_SUPPORT"): "densification_min_depth_support",
+        ("DENSIFICATION", "BURST_SUPPRESSION_ENABLED"): "densification_burst_suppression_enabled",
+        ("DENSIFICATION", "BURST_PENALTY_WEIGHT"): "densification_burst_penalty_weight",
+        ("DENSIFICATION", "SKY_SCORE_MULTIPLIER"): "densification_sky_score_multiplier",
+        ("DENSIFICATION", "LOW_PARALLAX_SCORE_MULTIPLIER"): "densification_low_parallax_score_multiplier",
         ("PRUNING", "IMPORTANCE_ENABLED"): "importance_pruning_enabled",
         ("PRUNING", "START_ITER"): "importance_pruning_start_iter",
         ("PRUNING", "INTERVAL"): "importance_pruning_interval",
         ("PRUNING", "MIN_OPACITY"): "importance_pruning_min_opacity",
         ("PRUNING", "MIN_VISIBILITY_COUNT"): "importance_pruning_min_visibility_count",
         ("PRUNING", "IMPORTANCE_THRESHOLD"): "importance_pruning_threshold",
+        ("PRUNING", "THIN_STRUCTURE_PROTECTION"): "thin_structure_protection",
+        ("PRUNING", "THIN_MIN_ANISOTROPY"): "thin_min_anisotropy",
+        ("PRUNING", "THIN_MIN_EDGE_SUPPORT"): "thin_min_edge_support",
+        ("PRUNING", "THIN_MIN_VIEW_BINS"): "thin_min_view_bins",
+        ("PRUNING", "THIN_MAX_PROJECTED_AREA"): "thin_max_projected_area",
+        ("PRUNING", "THIN_PROTECTION_DECAY_AFTER_ITER"): "thin_protection_decay_after_iter",
         ("INITIALIZATION", "MODE"): "initialization_mode",
         ("INITIALIZATION", "DENSE_PRIOR_PATH"): "dense_prior_path",
         ("INITIALIZATION", "CONFIDENCE_THRESHOLD"): "dense_prior_confidence_threshold",
@@ -85,6 +104,52 @@ def load_bts_geogs_config(path):
         ("EXPOSURE", "BIAS_REG_WEIGHT"): "exposure_bias_reg_weight",
         ("EXPOSURE", "ZERO_MEAN_REG_WEIGHT"): "exposure_zero_mean_reg_weight",
         ("EXPOSURE", "TEST_MODE"): "test_exposure_mode",
+        ("EXPOSURE", "TEST_K"): "exposure_test_k",
+        ("EXPOSURE", "POSITION_WEIGHT"): "exposure_position_weight",
+        ("EXPOSURE", "ANGLE_WEIGHT"): "exposure_angle_weight",
+        ("EXPOSURE", "TEMPORAL_WEIGHT"): "exposure_temporal_weight",
+        ("EXPOSURE", "FOCAL_WEIGHT"): "exposure_focal_weight",
+        ("EXPOSURE", "DISTANCE_TEMPERATURE"): "exposure_distance_temperature",
+        ("EXPOSURE", "CONFIDENCE_TEMPERATURE"): "exposure_confidence_temperature",
+        ("EXPOSURE", "MIN_CONFIDENCE"): "exposure_min_confidence",
+        ("EXPOSURE", "MAX_GAIN_DELTA_AT_TEST"): "exposure_max_gain_delta_at_test",
+        ("EXPOSURE", "MAX_BIAS_AT_TEST"): "exposure_max_bias_at_test",
+        ("CAMERA", "USE_UNDISTORTED_DATA"): "camera_use_undistorted_data",
+        ("CAMERA", "STRICT_MODEL_VALIDATION"): "camera_strict_model_validation",
+        ("CAMERA", "WARN_IF_DISTORTION_DROPPED"): "camera_warn_if_distortion_dropped",
+        ("SH_SCHEDULE", "ENABLED"): "sh_schedule_enabled",
+        ("SH_SCHEDULE", "MILESTONES"): "sh_schedule_milestones",
+        ("RESOLUTION_SCHEDULE", "ENABLED"): "resolution_schedule_enabled",
+        ("RESOLUTION_SCHEDULE", "STAGES"): "resolution_schedule_stages",
+        ("RESOLUTION_SCHEDULE", "CACHE_ON_CPU"): "resolution_cache_on_cpu",
+        ("DATA", "RESOLUTION"): "resolution",
+        ("SKY", "ENABLED"): "sky_enabled",
+        ("SKY", "MASK_DIR"): "sky_mask_dir",
+        ("SKY", "PHOTOMETRIC_WEIGHT"): "sky_photometric_weight",
+        ("SKY", "DEPTH_WEIGHT"): "sky_depth_weight",
+        ("SKY", "NORMAL_WEIGHT"): "sky_normal_weight",
+        ("SKY", "EDGE_WEIGHT"): "sky_edge_weight",
+        ("SKY", "DENSIFICATION_WEIGHT"): "densification_sky_score_multiplier",
+        ("SKY", "BACKGROUND_MODE"): "sky_background_mode",
+        ("SKY", "BACKGROUND_DEGREE"): "sky_background_degree",
+        ("SKY", "BACKGROUND_LR"): "sky_background_lr",
+        ("LOW_PARALLAX", "ENABLED"): "low_parallax_enabled",
+        ("LOW_PARALLAX", "MASK_DIR"): "low_parallax_mask_dir",
+        ("LOW_PARALLAX", "GEOMETRY_WEIGHT"): "low_parallax_geometry_weight",
+        ("LOW_PARALLAX", "DENSIFICATION_WEIGHT"): "densification_low_parallax_score_multiplier",
+        ("IMAGE_QUALITY", "SHARPNESS_AWARE_SAMPLING"): "sharpness_aware_sampling",
+        ("IMAGE_QUALITY", "MIN_SAMPLE_WEIGHT"): "sharpness_min_sample_weight",
+        ("IMAGE_QUALITY", "MAX_SAMPLE_WEIGHT"): "sharpness_max_sample_weight",
+        ("IMAGE_QUALITY", "BLUR_EDGE_WEIGHT_MIN"): "blur_edge_weight_min",
+        ("IMAGE_QUALITY", "USE_CHARBONNIER"): "use_charbonnier",
+        ("IMAGE_QUALITY", "CHARBONNIER_EPS"): "charbonnier_eps",
+        ("MULTIVIEW_DEPTH", "ENABLED"): "multiview_depth_enabled",
+        ("MULTIVIEW_DEPTH", "WEIGHT"): "multiview_depth_weight",
+        ("MULTIVIEW_DEPTH", "INTERVAL"): "multiview_depth_interval",
+        ("MULTIVIEW_DEPTH", "SIGMA_Z"): "multiview_depth_sigma",
+        ("MULTIVIEW_DEPTH", "RELATIVE_THRESHOLD"): "multiview_depth_relative_threshold",
+        ("VALIDATION", "SPLIT_FILE"): "validation_split_file",
+        ("VALIDATION", "STRICT_SPARSE_PATH"): "strict_sparse_path",
     }
     defaults = dict(config.get("OPTIMIZATION", {}))
     defaults.update(config.get("PIPELINE", {}))
@@ -145,11 +210,20 @@ class ModelParams(ParamGroup):
         self.depth_prior_dir = ""
         self.normal_prior_dir = ""
         self.confidence_prior_dir = ""
+        self.camera_use_undistorted_data = False
+        self.camera_strict_model_validation = True
+        self.camera_warn_if_distortion_dropped = True
+        self.validation_split_file = ""
+        self.strict_sparse_path = ""
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
+        for name in ("validation_split_file", "strict_sparse_path"):
+            value = getattr(g, name, "")
+            if value and not os.path.isabs(value):
+                setattr(g, name, os.path.abspath(os.path.join(g.source_path, value)))
         return g
 
 class PipelineParams(ParamGroup):
@@ -239,6 +313,16 @@ class OptimizationParams(ParamGroup):
         self.exposure_max_gain = 1.25
         self.exposure_max_bias = 0.10
         self.test_exposure_mode = "identity"
+        self.exposure_test_k = 4
+        self.exposure_position_weight = 1.0
+        self.exposure_angle_weight = 0.5
+        self.exposure_temporal_weight = 0.0
+        self.exposure_focal_weight = 0.0
+        self.exposure_distance_temperature = 0.10
+        self.exposure_confidence_temperature = 0.08
+        self.exposure_min_confidence = 0.0
+        self.exposure_max_gain_delta_at_test = 0.20
+        self.exposure_max_bias_at_test = 0.08
         self.loss_schedule_enabled = False
         self.loss_stage_a_end = 12_000
         self.loss_stage_b_end = 30_000
@@ -265,6 +349,62 @@ class OptimizationParams(ParamGroup):
         self.densification_score_threshold = 1.0
         self.densification_min_visibility_count = 3
         self.max_new_gaussians_per_step = 100_000
+        # BTS-GeoGS-v4 progressive schedules (disabled preserves v3 behavior).
+        self.sh_schedule_enabled = False
+        self.sh_schedule_milestones = [[0, 0], [3000, 1], [8000, 2], [18000, 3]]
+        self.resolution_schedule_enabled = False
+        self.resolution_schedule_stages = [
+            {"START_ITER": 0, "SCALE": 0.50},
+            {"START_ITER": 5000, "SCALE": 0.75},
+            {"START_ITER": 15000, "SCALE": 1.00},
+        ]
+        self.resolution_cache_on_cpu = True
+        self.densification_window_size = 100
+        self.densification_persistence_decay = 0.80
+        self.densification_min_persistent_windows = 3
+        self.densification_persistent_threshold = 1.0
+        self.densification_recent_window_count = 4
+        self.densification_min_recent_hits = 3
+        self.densification_unique_view_support_enabled = False
+        self.densification_unique_view_bins = 12
+        self.densification_min_unique_view_bins = 2
+        self.densification_multiview_weight = 0.15
+        self.densification_depth_support_weight = 0.10
+        self.densification_require_depth_consistency = False
+        self.densification_min_depth_support = 0.50
+        self.densification_burst_suppression_enabled = False
+        self.densification_burst_penalty_weight = 0.15
+        self.densification_sky_score_multiplier = 0.05
+        self.densification_low_parallax_score_multiplier = 0.20
+        self.thin_structure_protection = False
+        self.thin_min_anisotropy = 4.0
+        self.thin_min_edge_support = 0.50
+        self.thin_min_view_bins = 2
+        self.thin_max_projected_area = 16.0
+        self.thin_protection_decay_after_iter = 35_000
+        self.sky_enabled = False
+        self.sky_mask_dir = "masks/sky"
+        self.sky_photometric_weight = 0.50
+        self.sky_depth_weight = 0.0
+        self.sky_normal_weight = 0.0
+        self.sky_edge_weight = 0.05
+        self.sky_background_mode = "constant"
+        self.sky_background_degree = 2
+        self.sky_background_lr = 0.001
+        self.low_parallax_enabled = False
+        self.low_parallax_mask_dir = "masks/low_parallax"
+        self.low_parallax_geometry_weight = 0.20
+        self.sharpness_aware_sampling = False
+        self.sharpness_min_sample_weight = 0.50
+        self.sharpness_max_sample_weight = 1.50
+        self.blur_edge_weight_min = 0.20
+        self.use_charbonnier = False
+        self.charbonnier_eps = 0.001
+        self.multiview_depth_enabled = False
+        self.multiview_depth_weight = 0.01
+        self.multiview_depth_interval = 10
+        self.multiview_depth_sigma = 0.02
+        self.multiview_depth_relative_threshold = 0.05
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

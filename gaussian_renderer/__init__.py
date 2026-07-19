@@ -143,23 +143,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             cov3D_precomp = cov3D_precomp)
         
     canonical_image = rendered_image
-    exposure_applied = bool(use_trained_exp or apply_exposure)
-    if exposure_applied:
-        mode = "training" if use_trained_exp and exposure_mode is None else (exposure_mode or "training")
-        corrected_image = pc.apply_exposure(canonical_image, viewpoint_camera, mode=mode)
-        # Do not clamp before the photometric loss; metrics/visualization clamp.
-        rendered_image = corrected_image
-    else:
-        corrected_image = canonical_image
-        # Preserve exact historic baseline behavior when v3 exposure is off.
-        rendered_image = canonical_image.clamp(0, 1)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     out = {
         "render": rendered_image,
         "canonical_render": canonical_image,
-        "corrected_render": corrected_image,
+        "corrected_render": canonical_image,
         "viewspace_points": screenspace_points,
         "absgrad_viewspace_points": screenspace_points,
         "visibility_filter" : (radii > 0),
@@ -169,9 +159,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "depth": depth_image,
         "normal": None,
         "alpha": None,
+        "uncertainty": None,
+        "depth_variance": None,
+        "foreground_render": None,
+        "background_render": None,
         }
 
-    if render_geometry:
+    if render_geometry or pc.background_model is not None:
         # The existing CUDA extension composites arbitrary 3-channel features.
         # Render z, normal and a one-vector against a zero background to obtain
         # alpha-composited depth, normal and alpha without changing the kernel.
@@ -189,13 +183,43 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         z = torch.clamp(_camera_space_depth(means3D, viewpoint_camera), min=1e-6).repeat(1, 3)
         depth_sum = _rasterize_auxiliary_feature(aux_rasterizer, means3D, means2D, opacity, scales,
                                                   rotations, cov3D_precomp, z)[:1]
+        depth_sq_sum = _rasterize_auxiliary_feature(
+            aux_rasterizer, means3D, means2D, opacity, scales,
+            rotations, cov3D_precomp, z.square())[:1]
         normal_sum = _rasterize_auxiliary_feature(aux_rasterizer, means3D, means2D, opacity, scales,
                                                    rotations, cov3D_precomp,
                                                    _camera_space_normals(pc, viewpoint_camera))
         valid = alpha > 1e-6
         depth = torch.where(valid, depth_sum / alpha.clamp_min(1e-6), torch.zeros_like(depth_sum))
+        depth_second_moment = torch.where(
+            valid, depth_sq_sum / alpha.clamp_min(1e-6), torch.zeros_like(depth_sq_sum))
+        depth_variance = (depth_second_moment - depth.square()).clamp_min(0.0)
+        relative_std = torch.sqrt(depth_variance + 1e-8) / depth.clamp_min(1e-6)
+        uncertainty = (relative_std + (1.0 - alpha)).clamp(0.0, 1.0)
         normal = torch.nn.functional.normalize(normal_sum, dim=0, eps=1e-6)
         normal = torch.where(valid.expand_as(normal), normal, torch.zeros_like(normal))
-        out.update({"depth": depth, "normal": normal, "alpha": alpha})
+        out.update({"depth": depth, "normal": normal, "alpha": alpha,
+                    "uncertainty": uncertainty, "depth_variance": depth_variance})
+
+    if pc.background_model is not None:
+        alpha = out["alpha"]
+        background_image = pc.background_model(viewpoint_camera)
+        foreground_image = canonical_image - (1.0 - alpha) * bg_color[:, None, None]
+        canonical_image = foreground_image + (1.0 - alpha) * background_image
+        out.update({"canonical_render": canonical_image,
+                    "foreground_render": foreground_image,
+                    "background_render": background_image})
+
+    exposure_applied = bool(use_trained_exp or apply_exposure)
+    if exposure_applied:
+        mode = "training" if use_trained_exp and exposure_mode is None else (exposure_mode or "training")
+        corrected_image = pc.apply_exposure(canonical_image, viewpoint_camera, mode=mode)
+        rendered_image = corrected_image
+    else:
+        corrected_image = canonical_image
+        # Preserve exact historic baseline behavior when all new features are off.
+        rendered_image = canonical_image.clamp(0, 1)
+    out.update({"render": rendered_image, "canonical_render": canonical_image,
+                "corrected_render": corrected_image})
     
     return out

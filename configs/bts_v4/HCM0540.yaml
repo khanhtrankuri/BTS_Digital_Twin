@@ -1,0 +1,13 @@
+BASE: base.yaml
+CAMERA:
+  USE_UNDISTORTED_DATA: true
+SKY:
+  ENABLED: true
+  BACKGROUND_MODE: directional_sh
+LOW_PARALLAX:
+  ENABLED: true
+EXPOSURE:
+  TEST_MODE: pose_confidence_blend
+  CONFIDENCE_TEMPERATURE: 0.06
+  MAX_GAIN_DELTA_AT_TEST: 0.15
+

@@ -689,3 +689,67 @@ Recommended public-set experiment grid:
 | memory_safe | `--resolution 4 --densify_until_iter 8000 --densification_interval 200 --densify_grad_threshold 0.0004` |
 
 For each config, train `public_set`, write a separate `metrics_public_<config>.csv`, compare mean `score`, then train `private_set1` with the best public config. The score is `0.4 * (1 - LPIPS) + 0.3 * SSIM + 0.3 * PSNR_norm`, with `PSNR_norm = clamp(PSNR / psnr_max, 0, 1)`.
+
+## BTS-GeoGS-v4: camera-correct, pose-aware Stage 1
+
+The v4 implementation is opt-in and documented in [docs/BTS_GEOGS_V4_DESIGN.md](docs/BTS_GEOGS_V4_DESIGN.md). Existing configs and checkpoints remain supported.
+
+Prepare an HCM scene without overwriting raw data:
+
+```powershell
+python tools/prepare_undistorted_scene.py `
+  --source C:\Users\Lenovo\Documents\Val_Race\HCM0421 `
+  --output C:\data\Val_Race_undistorted\HCM0421 `
+  --alpha 0.0 --crop_mode valid --copy_sparse --process_masks
+```
+
+Create and inspect a pose-aware validation split:
+
+```powershell
+python tools/create_validation_split.py `
+  --source C:\Users\Lenovo\Documents\Val_Race\HCM0421 `
+  --output splits/HCM0421_temporal --mode temporal_matched --ratio 0.10
+
+python tools/analyze_pose_distribution.py `
+  --source C:\Users\Lenovo\Documents\Val_Race\HCM0421 `
+  --split splits/HCM0421_temporal/validation_split.json
+```
+
+Train the current v3 baseline and improved Stage 1 separately:
+
+```powershell
+python train.py -s C:\Users\Lenovo\Documents\Val_Race\HCM0421 `
+  -m output/HCM0421_v3 --config configs/bts_v3/full_hybrid.yaml `
+  --eval --disable_viewer
+
+python train.py -s C:\data\Val_Race_undistorted\HCM0421 `
+  -m output/HCM0421_v4 --config configs/bts_v4/HCM0421.yaml `
+  --eval --disable_viewer
+```
+
+Render validation geometry and final test poses:
+
+```powershell
+python render.py -m output/HCM0421_v4 --iteration 45000 `
+  --render_geometry --exposure_compensation `
+  --test_exposure_mode pose_confidence_blend
+
+python render_submission.py `
+  --data_root C:\data\Val_Race_undistorted `
+  --model_root output --iteration 45000 `
+  --exposure_compensation --test_exposure_mode pose_confidence_blend `
+  --output_dir submission_v4 --zip_path submission_v4.zip
+```
+
+Run reproducible Stage-1 ablations (add `--dry_run` to prepare manifests only):
+
+```powershell
+python tools/run_ablation.py `
+  --experiments A0 A1 A2 A3 `
+  --scenes HCM0421 HCM0644 `
+  --seeds 0 1 2 `
+  --data_root C:\Users\Lenovo\Documents\Val_Race `
+  --undistorted_root C:\data\Val_Race_undistorted
+```
+
+Shared multiview Stage 2 and MoE remain gated until strict Stage-1 validation exists. See [docs/MULTIVIEW_STAGE2.md](docs/MULTIVIEW_STAGE2.md) and [docs/MOE_ABLATION.md](docs/MOE_ABLATION.md); the runner rejects A11–A16 rather than launching unverified experiments.

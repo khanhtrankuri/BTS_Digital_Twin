@@ -139,7 +139,8 @@ def main():
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--skip_existing", action="store_true")
     parser.add_argument("--exposure_compensation", action="store_true")
-    parser.add_argument("--test_exposure_mode", choices=["identity", "nearest_camera", "weighted_nearest"], default="identity")
+    parser.add_argument("--test_exposure_mode", choices=["identity", "nearest_camera", "weighted_nearest",
+                        "pose_confidence_blend", "temporal_weighted", "pose_temporal_weighted"], default="identity")
 
     args = get_combined_args(parser)
 

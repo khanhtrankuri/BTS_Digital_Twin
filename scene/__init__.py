@@ -43,14 +43,22 @@ class Scene:
         # Camera construction needs these optimization switches to decide
         # whether edge/geometry priors should be materialized.
         if optimization_args is not None:
-            for name in ("geometry_aware", "edge_loss_enabled", "densification_edge_aware"):
+            for name in ("geometry_aware", "edge_loss_enabled", "densification_edge_aware",
+                         "sky_enabled", "sky_mask_dir", "low_parallax_enabled", "low_parallax_mask_dir",
+                         "sharpness_aware_sampling", "resolution_schedule_enabled", "resolution_cache_on_cpu"):
                 setattr(args, name, getattr(optimization_args, name, False))
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](
+                args.source_path, args.images, args.depths, args.eval, args.train_test_exp,
+                validation_split_file=args.validation_split_file,
+                strict_sparse_path=args.strict_sparse_path)
         elif os.path.exists(os.path.join(args.source_path, "train", "sparse")) and os.path.exists(os.path.join(args.source_path, "test", "test_poses.csv")):
             print("Found Phase1 train/test dataset layout!")
-            scene_info = sceneLoadTypeCallbacks["Phase1"](args.source_path, args.images, args.depths, args.eval, args.train_test_exp)
+            scene_info = sceneLoadTypeCallbacks["Phase1"](
+                args.source_path, args.images, args.depths, args.eval, args.train_test_exp,
+                validation_split_file=args.validation_split_file,
+                strict_sparse_path=args.strict_sparse_path)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
@@ -80,12 +88,20 @@ class Scene:
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
+            sharpness = [camera.sharpness for camera in self.train_cameras[resolution_scale]]
+            if sharpness:
+                minimum, maximum = min(sharpness), max(sharpness)
+                span = max(maximum - minimum, 1e-12)
+                for camera in self.train_cameras[resolution_scale]:
+                    camera.normalized_sharpness = (camera.sharpness - minimum) / span
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
 
         # One exposure implementation is shared by training, checkpointing and
         # inference. CameraInfo order matches the exposure mapping and Camera uid.
         self.gaussians.setup_exposure(scene_info.train_cameras, optimization_args)
+        self.gaussians.setup_background(
+            optimization_args, (1.0, 1.0, 1.0) if args.white_background else (0.0, 0.0, 0.0))
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
@@ -95,6 +111,8 @@ class Scene:
             exposure_path = os.path.join(self.model_path, "exposure.json")
             if self.gaussians.load_exposure_json(exposure_path):
                 print("Pretrained diagonal exposures loaded.")
+            if self.gaussians.load_background(os.path.join(self.model_path, "background.pt")):
+                print("Directional background loaded.")
         else:
             if optimization_args is not None and optimization_args.initialization_mode == "dense_prior":
                 from utils.dense_initialization import load_dense_initialization, voxel_downsample
@@ -114,6 +132,7 @@ class Scene:
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         self.gaussians.save_exposure_json(os.path.join(self.model_path, "exposure.json"))
+        self.gaussians.save_background(os.path.join(self.model_path, "background.pt"))
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]

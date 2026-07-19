@@ -65,6 +65,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             np.save(stem + "_depth.npy", package["depth"].detach().cpu().numpy())
             torchvision.utils.save_image(((package["normal"] + 1) * 0.5).clamp(0, 1), stem + "_normal.png")
             torchvision.utils.save_image(package["alpha"].clamp(0, 1), stem + "_alpha.png")
+            torchvision.utils.save_image(package["uncertainty"].clamp(0, 1), stem + "_uncertainty.png")
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool,
                 skip_test : bool, separate_sh: bool, render_geometry=False,
@@ -93,7 +94,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--render_geometry", action="store_true", help="Also save depth .npy, normal PNG and alpha PNG.")
     parser.add_argument("--exposure_compensation", action="store_true", help="Apply saved diagonal exposure parameters.")
-    parser.add_argument("--test_exposure_mode", choices=["identity", "nearest_camera", "weighted_nearest"], default="identity")
+    parser.add_argument("--test_exposure_mode", choices=["identity", "nearest_camera", "weighted_nearest",
+                        "pose_confidence_blend", "temporal_weighted", "pose_temporal_weighted"], default="identity")
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 

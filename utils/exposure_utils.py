@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 import torch
 from torch import nn
@@ -40,6 +41,8 @@ class PerViewExposure(nn.Module):
         self.raw_bias = nn.Parameter(torch.zeros((num_views, 3), dtype=torch.float32))
         self.register_buffer("camera_positions", torch.empty((0, 3), dtype=torch.float32), persistent=True)
         self.register_buffer("camera_directions", torch.empty((0, 3), dtype=torch.float32), persistent=True)
+        self.register_buffer("camera_focals", torch.empty((0,), dtype=torch.float32), persistent=True)
+        self.register_buffer("camera_times", torch.empty((0,), dtype=torch.float32), persistent=True)
 
     @property
     def num_views(self) -> int:
@@ -108,7 +111,7 @@ class PerViewExposure(nn.Module):
             self.raw_bias.zero_()
 
     @torch.no_grad()
-    def set_camera_poses(self, positions, directions) -> None:
+    def set_camera_poses(self, positions, directions, focals=None, times=None) -> None:
         positions = torch.as_tensor(positions, dtype=self.raw_gain.dtype, device=self.raw_gain.device)
         directions = torch.as_tensor(directions, dtype=self.raw_gain.dtype, device=self.raw_gain.device)
         if positions.shape != (self.num_views, 3) or directions.shape != (self.num_views, 3):
@@ -116,11 +119,40 @@ class PerViewExposure(nn.Module):
         self.camera_positions = positions
         self.camera_directions = torch.nn.functional.normalize(directions, dim=-1, eps=1e-6)
 
+        def optional_vector(value, name):
+            if value is None:
+                return torch.empty((0,), dtype=self.raw_gain.dtype, device=self.raw_gain.device)
+            result = torch.as_tensor(value, dtype=self.raw_gain.dtype, device=self.raw_gain.device).reshape(-1)
+            if result.shape != (self.num_views,):
+                raise ValueError(f"{name} must have shape [num_views]")
+            return result
+
+        self.camera_focals = optional_vector(focals, "focals")
+        self.camera_times = optional_vector(times, "times")
+
     def infer_gain_bias(self, position: torch.Tensor, direction: torch.Tensor,
-                        mode: str = "identity", k: int = 4):
+                        mode: str = "identity", k: int = 4, *, focal=None, time=None,
+                        position_weight: float = 1.0, angle_weight: float = 1.0,
+                        temporal_weight: float = 0.0, focal_weight: float = 0.0,
+                        distance_temperature: float = 0.10,
+                        confidence_temperature: float = 0.08,
+                        min_confidence: float = 0.0,
+                        max_gain_delta: float | None = None,
+                        max_bias: float | None = None,
+                        return_diagnostics: bool = False):
+        """Infer bounded test-view exposure from pose and optional time.
+
+        ``temporal_weighted`` uses only frame time when it is available;
+        ``pose_temporal_weighted`` combines all configured terms; and
+        ``pose_confidence_blend`` additionally fades the estimate to identity
+        when the nearest source is far away.
+        """
         if mode == "identity" or self.num_views == 0 or self.camera_positions.shape[0] != self.num_views:
-            return self.raw_gain.new_ones(3), self.raw_gain.new_zeros(3)
-        if mode not in ("nearest_camera", "weighted_nearest"):
+            result = (self.raw_gain.new_ones(3), self.raw_gain.new_zeros(3))
+            return (*result, {"mode": "identity", "confidence": 0.0}) if return_diagnostics else result
+        supported = {"nearest_camera", "weighted_nearest", "pose_confidence_blend",
+                     "temporal_weighted", "pose_temporal_weighted"}
+        if mode not in supported:
             raise ValueError(f"Unsupported test exposure mode: {mode}")
         position = torch.as_tensor(position, dtype=self.raw_gain.dtype, device=self.raw_gain.device)
         direction = torch.nn.functional.normalize(
@@ -128,14 +160,64 @@ class PerViewExposure(nn.Module):
         scene_scale = torch.linalg.vector_norm(
             self.camera_positions - self.camera_positions.mean(dim=0), dim=-1).median().clamp_min(1e-6)
         position_distance = torch.linalg.vector_norm(self.camera_positions - position, dim=-1) / scene_scale
-        direction_distance = 1.0 - (self.camera_directions * direction).sum(dim=-1).clamp(-1.0, 1.0)
-        distance = position_distance + direction_distance
+        direction_distance = torch.acos(
+            (self.camera_directions * direction).sum(dim=-1).clamp(-1.0 + 1e-7, 1.0 - 1e-7)) / math.pi
+        focal_distance = torch.zeros_like(position_distance)
+        if focal is not None and self.camera_focals.shape[0] == self.num_views:
+            query_focal = torch.as_tensor(focal, dtype=self.raw_gain.dtype, device=self.raw_gain.device).clamp_min(1e-6)
+            focal_distance = torch.abs(torch.log(self.camera_focals.clamp_min(1e-6) / query_focal))
+        time_distance = torch.zeros_like(position_distance)
+        time_available = time is not None and self.camera_times.shape[0] == self.num_views
+        if time_available:
+            query_time = torch.as_tensor(time, dtype=self.raw_gain.dtype, device=self.raw_gain.device)
+            time_scale = (self.camera_times.max() - self.camera_times.min()).clamp_min(1.0)
+            time_distance = torch.abs(self.camera_times - query_time) / time_scale
+
+        if mode == "temporal_weighted" and time_available:
+            distance = time_distance
+        else:
+            use_temporal = mode == "pose_temporal_weighted" or float(temporal_weight) > 0.0
+            distance = (float(position_weight) * position_distance
+                        + float(angle_weight) * direction_distance
+                        + float(focal_weight) * focal_distance
+                        + (float(temporal_weight) * time_distance if use_temporal and time_available else 0.0))
         gains, biases = self.gains(), self.biases()
         if mode == "nearest_camera":
             index = torch.argmin(distance)
-            return gains[index], biases[index]
+            gain, bias = gains[index], biases[index]
+            diagnostics = {"mode": mode, "indices": [int(index.item())], "weights": [1.0],
+                           "nearest_distance": float(distance[index].item()), "confidence": 1.0}
+            return (gain, bias, diagnostics) if return_diagnostics else (gain, bias)
         count = min(max(1, int(k)), self.num_views)
         values, indices = torch.topk(distance, k=count, largest=False)
-        weights = 1.0 / values.clamp_min(1e-6)
+        temperature = max(float(distance_temperature), 1e-6)
+        weights = torch.exp(-(values - values.min()) / temperature)
         weights = weights / weights.sum()
-        return (weights[:, None] * gains[indices]).sum(dim=0), (weights[:, None] * biases[indices]).sum(dim=0)
+        gain = (weights[:, None] * gains[indices]).sum(dim=0)
+        bias = (weights[:, None] * biases[indices]).sum(dim=0)
+        confidence = torch.exp(-values[0] / max(float(confidence_temperature), 1e-6))
+        confidence = torch.where(confidence >= float(min_confidence), confidence, torch.zeros_like(confidence))
+        if mode == "pose_confidence_blend":
+            gain = 1.0 + confidence * (gain - 1.0)
+            bias = confidence * bias
+        if max_gain_delta is not None:
+            delta = abs(float(max_gain_delta))
+            gain = gain.clamp(1.0 - delta, 1.0 + delta)
+        if max_bias is not None:
+            bias = bias.clamp(-abs(float(max_bias)), abs(float(max_bias)))
+        diagnostics = {
+            "mode": mode, "indices": [int(v) for v in indices.detach().cpu().tolist()],
+            "weights": [float(v) for v in weights.detach().cpu().tolist()],
+            "distances": [float(v) for v in values.detach().cpu().tolist()],
+            "nearest_distance": float(values[0].item()), "confidence": float(confidence.item()),
+            "gain": [float(v) for v in gain.detach().cpu().tolist()],
+            "bias": [float(v) for v in bias.detach().cpu().tolist()],
+        }
+        return (gain, bias, diagnostics) if return_diagnostics else (gain, bias)
+
+
+def frame_time_from_name(image_name: str) -> float | None:
+    """Extract the final numeric token from an image name as capture time."""
+
+    tokens = re.findall(r"\d+", str(image_name))
+    return float(tokens[-1]) if tokens else None

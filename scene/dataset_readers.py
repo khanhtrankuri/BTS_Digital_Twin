@@ -23,6 +23,7 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+from utils.camera_models import parse_colmap_intrinsics, validate_camera_intrinsics
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -39,6 +40,13 @@ class CameraInfo(NamedTuple):
     width: int
     height: int
     is_test: bool
+    camera_model: str = "PINHOLE"
+    fx: float = 0.0
+    fy: float = 0.0
+    distortion_params: tuple = ()
+    difficulty_bin: str = ""
+    normalized_position_distance: float = 0.0
+    view_angle_degrees: float = 0.0
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -88,21 +96,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        if intr.model in ["SIMPLE_PINHOLE", "SIMPLE_RADIAL", "RADIAL"]:
-            focal_length_x = intr.params[0]
-            cx = intr.params[1]
-            cy = intr.params[2]
-            FovY = focal2fov(focal_length_x, height)
-            FovX = focal2fov(focal_length_x, width)
-        elif intr.model in ["PINHOLE", "OPENCV", "OPENCV_FISHEYE", "FULL_OPENCV"]:
-            focal_length_x = intr.params[0]
-            focal_length_y = intr.params[1]
-            cx = intr.params[2]
-            cy = intr.params[3]
-            FovY = focal2fov(focal_length_y, height)
-            FovX = focal2fov(focal_length_x, width)
-        else:
-            assert False, f"Colmap camera model not handled: {intr.model}"
+        parsed = parse_colmap_intrinsics(intr.model, intr.params)
+        focal_length_x, focal_length_y = parsed.fx, parsed.fy
+        cx, cy = parsed.cx, parsed.cy
+        FovY = focal2fov(focal_length_y, height)
+        FovX = focal2fov(focal_length_x, width)
 
         n_remove = len(extr.name.split('.')[-1]) + 1
         depth_params = None
@@ -120,7 +118,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, cx=cx, cy=cy, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                              width=width, height=height, is_test=image_name in test_cam_names_list,
+                              camera_model=parsed.camera_model, fx=parsed.fx, fy=parsed.fy,
+                              distortion_params=parsed.distortion)
+        validate_camera_intrinsics(cam_info)
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -151,19 +152,22 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8,
+                        validation_split_file="", strict_sparse_path=""):
+    sparse_root = os.path.join(path, "sparse", "0")
+    point_sparse_root = strict_sparse_path if strict_sparse_path else sparse_root
     try:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+        cameras_extrinsic_file = os.path.join(sparse_root, "images.bin")
+        cameras_intrinsic_file = os.path.join(sparse_root, "cameras.bin")
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
     except:
-        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
+        cameras_extrinsic_file = os.path.join(sparse_root, "images.txt")
+        cameras_intrinsic_file = os.path.join(sparse_root, "cameras.txt")
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    depth_params_file = os.path.join(path, "sparse/0", "depth_params.json")
+    depth_params_file = os.path.join(sparse_root, "depth_params.json")
     ## if depth_params_file isnt there AND depths file is here -> throw error
     depths_params = None
     if depths != "":
@@ -185,8 +189,15 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             print(f"An unexpected error occurred when trying to open depth_params.json file: {e}")
             sys.exit(1)
 
+    split = None
+    if validation_split_file:
+        with open(validation_split_file, "r", encoding="utf-8") as handle:
+            split = json.load(handle)
     if eval:
-        if "360" in path:
+        if split is not None:
+            test_cam_names_list = list(split["validation_images"])
+            print(f"------------POSE-AWARE HOLDOUT ({len(test_cam_names_list)})-------------")
+        elif "360" in path:
             llffhold = 8
         if llffhold:
             print("------------LLFF HOLD-------------")
@@ -205,15 +216,23 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         images_folder=os.path.join(path, reading_dir), 
         depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    if split is not None:
+        sample_metadata = {sample["image_name"]: sample for sample in split.get("samples", [])}
+        cam_infos = [camera._replace(
+            difficulty_bin=sample_metadata.get(camera.image_name, {}).get("difficulty_bin", ""),
+            normalized_position_distance=float(sample_metadata.get(camera.image_name, {}).get(
+                "normalized_position_distance", 0.0)),
+            view_angle_degrees=float(sample_metadata.get(camera.image_name, {}).get("view_angle_degrees", 0.0)))
+            for camera in cam_infos]
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     test_cam_infos = [c for c in cam_infos if c.is_test]
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    ply_path = os.path.join(point_sparse_root, "points3D.ply")
+    bin_path = os.path.join(point_sparse_root, "points3D.bin")
+    txt_path = os.path.join(point_sparse_root, "points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
@@ -261,13 +280,19 @@ def readPhase1TestCameras(path, is_test=True):
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, cx=cx, cy=cy, depth_params=None,
                                         image_path=image_path, image_name=image_name, depth_path="",
-                                        width=width, height=height, is_test=is_test))
+                                        width=width, height=height, is_test=is_test,
+                                        camera_model="PINHOLE", fx=focal_length_x, fy=focal_length_y,
+                                        distortion_params=()))
     return cam_infos
 
-def readPhase1SceneInfo(path, images, depths, eval, train_test_exp):
+def readPhase1SceneInfo(path, images, depths, eval, train_test_exp,
+                        validation_split_file="", strict_sparse_path=""):
     train_path = os.path.join(path, "train")
-    scene_info = readColmapSceneInfo(train_path, images, depths, False, train_test_exp)
-    test_cameras = readPhase1TestCameras(path) if eval else []
+    scene_info = readColmapSceneInfo(
+        train_path, images, depths, bool(validation_split_file), train_test_exp,
+        validation_split_file=validation_split_file, strict_sparse_path=strict_sparse_path)
+    test_cameras = (scene_info.test_cameras if validation_split_file
+                    else (readPhase1TestCameras(path) if eval else []))
 
     return SceneInfo(point_cloud=scene_info.point_cloud,
                      train_cameras=scene_info.train_cameras,
@@ -318,7 +343,10 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
                             cx=image.size[0] / 2.0, cy=image.size[1] / 2.0,
                             image_path=image_path, image_name=image_name,
-                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
+                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None,
+                            is_test=is_test, camera_model="PINHOLE",
+                            fx=fov2focal(FovX, image.size[0]), fy=fov2focal(FovY, image.size[1]),
+                            distortion_params=()))
             
     return cam_infos
 
