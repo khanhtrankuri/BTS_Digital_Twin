@@ -651,7 +651,16 @@ python evaluate_public.py \
   --csv_path metrics_public.csv
 ```
 
-Train all scenes in `private_set1`:
+### Sequential Stage 1 + Stage 2 training for `private_set1`
+
+Run the following commands in order. Stage 1 and Stage 2 are not trained jointly:
+Stage 2 consumes frozen renders from the completed Stage 1 models. Stage 1 may
+train several scenes in parallel across GPUs, but Stage 2 is trained **only once**
+from the combined manifest of all scenes.
+
+1. Train Stage 1 for every scene. This command discovers the child scene
+   directories and schedules one Stage 1 process per available GPU:
+
 ```bash
 python train_multi_cuda.py \
   -s /kaggle/working/bts-dataset/phase1/private_set1 \
@@ -665,7 +674,83 @@ python train_multi_cuda.py \
      --save_iterations 30000
 ```
 
-Render the private submission at the exact CSV resolution and zip it:
+Do not start the next step until this command has completed successfully for all
+scenes. The checkpoints are written to
+`output/multigpu_private/<scene_name>/point_cloud/iteration_30000/`.
+
+2. Freeze the Stage 1 checkpoints and export their RGB, depth, normal, alpha,
+   and ground-truth images. Export is sequential to avoid loading multiple
+   Gaussian models on the same GPU. The command creates one combined manifest
+   for all scenes:
+
+```bash
+python tools/export_stage2_dataset.py \
+  -s /kaggle/working/bts-dataset/phase1/private_set1 \
+  -m output/multigpu_private \
+  --iteration 30000 \
+  --output_dir data/stage2/private_set1 \
+  --split train,val \
+  --val_ratio 0.10 \
+  --split_seed 42 \
+  --resolution 2
+```
+
+The resulting combined manifest is
+`data/stage2/private_set1/manifest.json`. Test poses without ground-truth RGB
+are never used as Stage 2 targets.
+
+3. Train one shared Stage 2 refiner on the combined manifest. Do not run this
+   command once per scene:
+
+```bash
+python train_stage2.py \
+  --config configs/stage2/nafnet_base.yaml \
+  --manifest data/stage2/private_set1/manifest.json \
+  --output_dir output/stage2/private_set1
+```
+
+If Stage 2 is interrupted, resume the same run instead of starting over:
+
+```bash
+python train_stage2.py \
+  --config configs/stage2/nafnet_base.yaml \
+  --manifest data/stage2/private_set1/manifest.json \
+  --output_dir output/stage2/private_set1 \
+  --resume output/stage2/private_set1/last.pth
+```
+
+4. Optionally evaluate Stage 1 versus Stage 1 + Stage 2 on the held-out
+   validation views:
+
+```bash
+python evaluate_stage2.py \
+  --config configs/stage2/nafnet_base.yaml \
+  --checkpoint output/stage2/private_set1/best.pth \
+  --manifest data/stage2/private_set1/manifest.json \
+  --split val \
+  --output_dir evaluation/private_set1
+```
+
+5. Render a private test scene with the shared Stage 2 checkpoint. Repeat only
+   this inexpensive render command for the remaining scenes; Stage 2 does not
+   need to be retrained:
+
+```bash
+python render_with_refiner.py \
+  -s /kaggle/working/bts-dataset/phase1/private_set1/HNI0366 \
+  -m output/multigpu_private/HNI0366 \
+  --stage1_iteration 30000 \
+  --refiner_config configs/stage2/nafnet_base.yaml \
+  --refiner_checkpoint output/stage2/private_set1/best.pth \
+  --output_dir output/final/HNI0366 \
+  --split test \
+  --resolution 1
+```
+
+The unchanged Stage 1-only submission can still be rendered at the exact CSV
+resolution and zipped with the command below. This command does **not** apply
+the Stage 2 refiner:
+
 ```bash
 python render_submission.py \
   --data_root /kaggle/working/bts-dataset/phase1/private_set1 \
