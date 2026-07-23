@@ -74,6 +74,49 @@ Chạy unit test:
 python -m pytest -q
 ```
 
+## Chạy tự động bằng `run.sh`
+
+Trên Ubuntu, Linux hoặc WSL, script sau tự kiểm tra CUDA extension, chuẩn bị
+năm scene HCM nếu cần, train đủ bảy scene, render và tạo ZIP:
+
+```bash
+conda activate BTS
+chmod +x run.sh
+./run.sh /data/Val_Race
+```
+
+Ví dụ dataset nằm trên ổ D khi dùng WSL:
+
+```bash
+./run.sh /mnt/d/Val_Race
+```
+
+Các output mặc định:
+
+```text
+data/bts_v11_prepared/
+output/bts_v11_4090/
+submission_bts_v11/
+submission_bts_v11.zip
+submission_bts_v11.manifest.json
+```
+
+Có thể thay đường dẫn hoặc profile bằng biến môi trường:
+
+```bash
+DATA_ROOT=/data/Val_Race \
+MODEL_ROOT=/workspace/models/bts_v11 \
+ZIP_PATH=/workspace/submission_bts_v11.zip \
+GPU_PROFILE=rtx4090_24gb \
+./run.sh
+```
+
+Xem toàn bộ tùy chọn:
+
+```bash
+./run.sh --help
+```
+
 ## Cấu trúc dataset
 
 Ví dụ đặt dữ liệu tại `D:\Val_Race`:
