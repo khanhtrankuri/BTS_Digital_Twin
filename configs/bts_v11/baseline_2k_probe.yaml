@@ -1,0 +1,21 @@
+# Matched control for the AbsGS 2k strict-position probe.
+OPTIMIZATION:
+  iterations: 2000
+  geometry_aware: false
+  loss_schedule_enabled: false
+  exposure_compensation: false
+
+DATA:
+  RESOLUTION: 2
+
+DENSIFICATION:
+  METHOD: original
+  FROM_ITER: 500
+  UNTIL_ITER: 2000
+  INTERVAL: 100
+
+EXPOSURE:
+  ENABLED: false
+
+PIPELINE:
+  antialiasing: true

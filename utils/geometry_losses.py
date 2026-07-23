@@ -92,6 +92,39 @@ def gaussian_scale_regularization(scales, max_scale, max_anisotropy_ratio=None,
     return loss
 
 
+def ray_depth_variance_loss(
+    depth: torch.Tensor,
+    depth_variance: torch.Tensor,
+    alpha: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    confidence: torch.Tensor | None = None,
+    min_alpha: float = 0.4,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Penalize alpha/confidence-weighted relative camera-z depth variance."""
+
+    if depth.shape != depth_variance.shape or depth.shape != alpha.shape:
+        raise ValueError("depth, depth_variance and alpha must have identical shapes")
+    finite = torch.isfinite(depth) & torch.isfinite(depth_variance) & torch.isfinite(alpha)
+    valid = finite & (depth > eps) & (depth_variance >= 0) & (alpha >= float(min_alpha))
+    if valid_mask is not None:
+        valid &= valid_mask.to(device=depth.device).bool()
+    weights = torch.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0).square()
+    if confidence is not None:
+        confidence_value = torch.nan_to_num(
+            confidence.to(device=depth.device, dtype=depth.dtype),
+            nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+        valid &= torch.isfinite(confidence.to(device=depth.device))
+        weights = weights * confidence_value
+    weights = weights * valid.to(depth.dtype)
+    if not torch.any(weights > 0):
+        return _zero_with_grad(depth_variance)
+    relative = torch.nan_to_num(
+        depth_variance / (depth.square() + float(eps)),
+        nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    return (weights * relative).sum() / weights.sum().clamp_min(float(eps))
+
+
 def sobel_edge_map(rgb, eps=1e-6):
     """Return a normalized, cached-friendly Sobel edge map using only PyTorch."""
     if rgb.dim() == 3:

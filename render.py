@@ -19,7 +19,13 @@ from gaussian_renderer import render
 import torchvision
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
-from arguments import ModelParams, PipelineParams, get_combined_args
+from arguments import (
+    ModelParams,
+    PipelineParams,
+    get_combined_args,
+    load_model_config_defaults,
+    load_model_optimization_args,
+)
 from gaussian_renderer import GaussianModel
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -72,7 +78,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                 exposure_compensation=False, test_exposure_mode="identity"):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        optimization_args = load_model_optimization_args(dataset.model_path)
+        scene = Scene(
+            dataset, gaussians, load_iteration=iteration, shuffle=False,
+            optimization_args=optimization_args)
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -95,8 +104,12 @@ if __name__ == "__main__":
     parser.add_argument("--render_geometry", action="store_true", help="Also save depth .npy, normal PNG and alpha PNG.")
     parser.add_argument("--exposure_compensation", action="store_true", help="Apply saved diagonal exposure parameters.")
     parser.add_argument("--test_exposure_mode", choices=["identity", "nearest_camera", "weighted_nearest",
-                        "pose_confidence_blend", "temporal_weighted", "pose_temporal_weighted"], default="identity")
+                        "pose_confidence_blend", "temporal_weighted", "pose_temporal_weighted",
+                        "temporal_spline"], default="identity")
     args = get_combined_args(parser)
+    model_defaults = load_model_config_defaults(args.model_path)
+    if model_defaults is not None:
+        args.antialiasing = bool(model_defaults.get("antialiasing", args.antialiasing))
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)

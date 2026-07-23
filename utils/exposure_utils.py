@@ -9,6 +9,118 @@ import torch
 from torch import nn
 
 
+class TemporalExposureSpline(nn.Module):
+    """Bounded linear/cubic B-spline exposure field plus small view residuals."""
+
+    def __init__(self, frame_times, num_knots: int = 12, degree: int = 3,
+                 min_gain: float = 0.75, max_gain: float = 1.25,
+                 max_bias: float = 0.10, per_view_residual: bool = True):
+        super().__init__()
+        if num_knots < 2 or degree not in (1, 3) or (degree == 3 and num_knots < 4):
+            raise ValueError("temporal spline needs degree 1/3 and enough knots")
+        self.num_knots = int(num_knots)
+        self.degree = int(degree)
+        self.min_gain = float(min_gain)
+        self.max_gain = float(max_gain)
+        self.max_bias = float(max_bias)
+        values = [float(value) if value is not None else float("nan") for value in frame_times]
+        times = torch.tensor(values, dtype=torch.float32)
+        finite = torch.isfinite(times)
+        self.has_real_times = bool(finite.any())
+        if finite.any():
+            if not finite.all():
+                fallback = torch.linspace(times[finite].min(), times[finite].max(), times.numel())
+                times = torch.where(finite, times, fallback)
+            time_min, time_max = times.min(), times.max()
+            normalized = (times - time_min) / (time_max - time_min).clamp_min(1e-6)
+        else:
+            time_min, time_max = torch.tensor(0.0), torch.tensor(1.0)
+            normalized = torch.linspace(0.0, 1.0, max(1, times.numel()))
+        self.register_buffer("normalized_times", normalized, persistent=True)
+        self.register_buffer("time_min", time_min.reshape(()), persistent=True)
+        self.register_buffer("time_max", time_max.reshape(()), persistent=True)
+
+        midpoint = 0.5 * (self.min_gain + self.max_gain)
+        half_range = 0.5 * (self.max_gain - self.min_gain)
+        identity = max(-1.0 + 1e-7, min(1.0 - 1e-7, (1.0 - midpoint) / half_range))
+        identity_raw = 0.5 * math.log((1.0 + identity) / (1.0 - identity))
+        self.raw_gain_knots = nn.Parameter(torch.full((num_knots, 3), identity_raw))
+        self.raw_bias_knots = nn.Parameter(torch.zeros((num_knots, 3)))
+        residual_views = int(times.numel()) if per_view_residual else 0
+        self.raw_gain_residual = nn.Parameter(torch.zeros((residual_views, 3)))
+        self.raw_bias_residual = nn.Parameter(torch.zeros((residual_views, 3)))
+
+    @property
+    def num_views(self) -> int:
+        return int(self.normalized_times.numel())
+
+    def _knot_values(self) -> tuple[torch.Tensor, torch.Tensor]:
+        midpoint = 0.5 * (self.min_gain + self.max_gain)
+        half_range = 0.5 * (self.max_gain - self.min_gain)
+        gain = midpoint + half_range * torch.tanh(self.raw_gain_knots)
+        bias = self.max_bias * torch.tanh(self.raw_bias_knots)
+        return gain, bias
+
+    def _evaluate_values(self, values: torch.Tensor, normalized_time: torch.Tensor) -> torch.Tensor:
+        t = normalized_time.to(device=values.device, dtype=values.dtype).clamp(0.0, 1.0)
+        if self.degree == 1:
+            position = t * (self.num_knots - 1)
+            left = torch.floor(position).long().clamp(0, self.num_knots - 1)
+            right = (left + 1).clamp_max(self.num_knots - 1)
+            fraction = (position - left.to(position.dtype))[..., None]
+            return (1.0 - fraction) * values[left] + fraction * values[right]
+        position = t * (self.num_knots - 3)
+        start = torch.floor(position).long().clamp(0, self.num_knots - 4)
+        u = (position - start.to(position.dtype))[..., None]
+        weights = torch.cat((
+            (1.0 - u).pow(3) / 6.0,
+            (3.0 * u.pow(3) - 6.0 * u.square() + 4.0) / 6.0,
+            (-3.0 * u.pow(3) + 3.0 * u.square() + 3.0 * u + 1.0) / 6.0,
+            u.pow(3) / 6.0,
+        ), dim=-1)
+        indices = start[..., None] + torch.arange(4, device=values.device)
+        return (weights[..., None] * values[indices]).sum(dim=-2)
+
+    def evaluate(self, normalized_time: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        gain, bias = self._knot_values()
+        return (self._evaluate_values(gain, normalized_time),
+                self._evaluate_values(bias, normalized_time))
+
+    def gains_biases(self) -> tuple[torch.Tensor, torch.Tensor]:
+        gain, bias = self.evaluate(self.normalized_times)
+        if self.raw_gain_residual.shape[0] == self.num_views:
+            gain_scale = 0.25 * (self.max_gain - self.min_gain)
+            gain = gain + gain_scale * torch.tanh(self.raw_gain_residual)
+            bias = bias + 0.25 * self.max_bias * torch.tanh(self.raw_bias_residual)
+        return gain.clamp(self.min_gain, self.max_gain), bias.clamp(-self.max_bias, self.max_bias)
+
+    def forward(self, image: torch.Tensor, view_index) -> torch.Tensor:
+        gain, bias = self.gains_biases()
+        gain, bias = gain[view_index], bias[view_index]
+        while gain.ndim < image.ndim:
+            gain, bias = gain.unsqueeze(-1), bias.unsqueeze(-1)
+        return gain * image + bias
+
+    def infer_time(self, frame_time) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if frame_time is None or not self.has_real_times:
+            return None
+        value = torch.as_tensor(frame_time, device=self.time_min.device, dtype=self.time_min.dtype)
+        normalized = (value - self.time_min) / (self.time_max - self.time_min).clamp_min(1e-6)
+        return self.evaluate(normalized)
+
+    def regularization_loss(self, smoothness_weight: float, residual_weight: float) -> torch.Tensor:
+        gain, bias = self._knot_values()
+        if self.num_knots >= 3:
+            gain_second = gain[:-2] - 2.0 * gain[1:-1] + gain[2:]
+            bias_second = bias[:-2] - 2.0 * bias[1:-1] + bias[2:]
+            smoothness = gain_second.square().mean() + bias_second.square().mean()
+        else:
+            smoothness = (gain.sum() + bias.sum()) * 0.0
+        residual = (self.raw_gain_residual.square().mean() + self.raw_bias_residual.square().mean()
+                    if self.raw_gain_residual.numel() else smoothness * 0.0)
+        return float(smoothness_weight) * smoothness + float(residual_weight) * residual
+
+
 class PerViewExposure(nn.Module):
     """Diagonal RGB gain and bias with differentiable hard bounds.
 

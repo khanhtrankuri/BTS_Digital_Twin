@@ -39,6 +39,15 @@ def unproject_z_depth(depth: torch.Tensor, camera) -> torch.Tensor:
     device, dtype = depth.device, depth.dtype
     v, u = torch.meshgrid(torch.arange(height, device=device, dtype=dtype),
                           torch.arange(width, device=device, dtype=dtype), indexing="ij")
+    return unproject_pixels(u, v, depth, camera)
+
+
+def unproject_pixels(u: torch.Tensor, v: torch.Tensor, depth: torch.Tensor, camera) -> torch.Tensor:
+    """Unproject arbitrary pixel-center indices and camera z-depth to world XYZ."""
+
+    if u.shape != v.shape or u.shape != depth.shape:
+        raise ValueError("u, v and depth must have identical shapes")
+    device, dtype = depth.device, depth.dtype
     x = (u + 0.5 - float(camera.cx)) / float(camera.fx) * depth
     y = (v + 0.5 - float(camera.cy)) / float(camera.fy) * depth
     camera_points = torch.stack((x, y, depth, torch.ones_like(depth)), dim=-1)
@@ -76,16 +85,28 @@ def pairwise_depth_consistency(target_depth: torch.Tensor, source_depth: torch.T
                                min_alpha: float = 0.01, eps: float = 1e-6) -> DepthConsistencyResult:
     """Reproject target depth into a source rendered-depth map."""
 
-    target = _depth_2d(target_depth)
+    target_raw = _depth_2d(target_depth)
+    finite_target = torch.isfinite(target_raw)
+    target = torch.nan_to_num(target_raw, nan=0.0, posinf=0.0, neginf=0.0)
     source = _depth_2d(source_depth).to(device=target.device, dtype=target.dtype)
     world = unproject_z_depth(target, target_camera)
     u, v, projected_z = project_world_points(world, source_camera)
-    grid = pixel_grid(u, v, source.shape[1], source.shape[0])
-    sampled = F.grid_sample(source[None, None], grid[None], mode="bilinear",
+    raw_grid = pixel_grid(u, v, source.shape[1], source.shape[0])
+    # Invalid/behind-camera points can produce inf coordinates. grid_sample may
+    # return a finite zero forward but an undefined grid gradient backward, so
+    # sanitize before sampling rather than masking only after projection.
+    grid = torch.nan_to_num(raw_grid, nan=2.0, posinf=2.0, neginf=-2.0)
+    source_safe = torch.nan_to_num(source, nan=0.0, posinf=0.0, neginf=0.0)
+    sampled = F.grid_sample(source_safe[None, None], grid[None], mode="bilinear",
                             padding_mode="zeros", align_corners=False)[0, 0]
-    relative = torch.abs(projected_z - sampled) / sampled.abs().clamp_min(eps)
+    projected_safe = torch.nan_to_num(projected_z, nan=0.0, posinf=0.0, neginf=0.0)
+    relative = torch.nan_to_num(
+        torch.abs(projected_safe - sampled) / sampled.abs().clamp_min(eps),
+        nan=1e6, posinf=1e6, neginf=1e6)
     inside = (grid[..., 0].abs() <= 1.0) & (grid[..., 1].abs() <= 1.0)
-    valid = (target > eps) & (projected_z > eps) & (sampled > eps) & inside
+    finite = (finite_target & torch.isfinite(projected_z)
+              & torch.isfinite(raw_grid).all(dim=-1))
+    valid = finite & (target > eps) & (projected_z > eps) & (sampled > eps) & inside
     if target_alpha is not None:
         valid &= _depth_2d(target_alpha) >= min_alpha
     if source_alpha is not None:
@@ -95,7 +116,8 @@ def pairwise_depth_consistency(target_depth: torch.Tensor, source_depth: torch.T
         valid &= sampled_alpha >= min_alpha
     if sky_mask is not None:
         valid &= _depth_2d(sky_mask).to(device=target.device) < 0.5
-    confidence = torch.exp(-relative / max(float(sigma_z), eps)) * valid.to(target.dtype)
+    confidence = torch.where(
+        valid, torch.exp(-relative / max(float(sigma_z), eps)), torch.zeros_like(relative))
     hard = valid & (relative <= float(relative_threshold))
     return DepthConsistencyResult(projected_z[None], sampled[None], relative[None], hard[None],
                                   confidence[None], grid)

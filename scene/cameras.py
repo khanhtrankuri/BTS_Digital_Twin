@@ -64,6 +64,7 @@ class Camera(nn.Module):
         self.cache_images_on_cpu = bool(cache_images_on_cpu)
         self.image_storage_device = torch.device("cpu") if self.cache_images_on_cpu else self.data_device
         gt_image = resized_image_rgb[:3, ...]
+        self.mean_brightness = float(gt_image.mean().item()) if has_ground_truth else None
         self.alpha_mask = None
         if resized_image_rgb.shape[0] == 4:
             self.alpha_mask = resized_image_rgb[3:4, ...].to(self.image_storage_device)

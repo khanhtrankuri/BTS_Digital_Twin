@@ -102,6 +102,36 @@ def _remap(array: np.ndarray, map_x: np.ndarray, map_y: np.ndarray, kind: str) -
     return result
 
 
+def redistortion_maps(metadata: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Map pixels on the original distorted grid into the prepared pinhole grid."""
+
+    old_width, old_height = map(int, metadata["old_size"])
+    old_k = np.asarray(metadata["old_camera_matrix"], dtype=np.float64)
+    distortion = np.asarray(metadata["opencv_distortion"], dtype=np.float64)
+    new_k = np.asarray(metadata["new_camera_matrix"], dtype=np.float64)
+    grid_x, grid_y = np.meshgrid(
+        np.arange(old_width, dtype=np.float32),
+        np.arange(old_height, dtype=np.float32))
+    distorted_pixels = np.stack((grid_x, grid_y), axis=-1).reshape(-1, 1, 2)
+    undistorted_pixels = cv2.undistortPoints(
+        distorted_pixels, old_k, distortion, P=new_k).reshape(old_height, old_width, 2)
+    return undistorted_pixels[..., 0], undistorted_pixels[..., 1]
+
+
+def redistort_render(array: np.ndarray, metadata: dict) -> np.ndarray:
+    """Resample a prepared-grid RGB render onto the source/evaluator pixel grid."""
+
+    new_width, new_height = map(int, metadata["new_size"])
+    if array.shape[:2] != (new_height, new_width):
+        raise ValueError(
+            f"Expected an undistorted render of {new_width}x{new_height}, "
+            f"got {array.shape[1]}x{array.shape[0]}")
+    map_x, map_y = redistortion_maps(metadata)
+    return cv2.remap(
+        array, map_x, map_y, cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
 def _read_array(path: Path) -> np.ndarray:
     if path.suffix.lower() == ".npy":
         return np.load(path)

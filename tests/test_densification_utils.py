@@ -2,6 +2,7 @@ import torch
 
 from utils.densification_utils import (
     accumulate_visible_statistics,
+    conservative_opacity_prune_mask,
     corrected_residual_map,
     limit_mask,
     percentile_mask,
@@ -46,3 +47,11 @@ def test_exposure_correction_removes_brightness_only_residual():
     canonical_residual = corrected_residual_map(canonical, gt, "l1").mean()
     corrected_residual = corrected_residual_map(canonical * 1.2 + 0.05, gt, "l1").mean()
     assert corrected_residual < canonical_residual
+
+
+def test_low_opacity_is_not_a_sufficient_pruning_signal():
+    opacity = torch.tensor([0.001, 0.001, 0.5, 0.001])
+    visibility = torch.tensor([10, 0, 0, 0])
+    age = torch.tensor([1000, 1000, 1000, 10])
+    selected = conservative_opacity_prune_mask(opacity, visibility, age, 0.005, 200)
+    assert selected.tolist() == [False, True, False, False]

@@ -110,6 +110,11 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
         invdepthmap = None
         
     orig_w, orig_h = image.size
+    if (getattr(args, "camera_use_undistorted_data", False)
+            and (orig_w, orig_h) != (int(cam_info.width), int(cam_info.height))):
+        raise ValueError(
+            f"Undistorted image/model size mismatch for {cam_info.image_name}: "
+            f"image={(orig_w, orig_h)}, COLMAP={(cam_info.width, cam_info.height)}")
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
     else:  # should be a type that converts to float
@@ -161,8 +166,9 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                   normal_prior=normal_prior, confidence_map=confidence_map,
                   sky_mask=sky_mask, low_parallax_mask=low_parallax_mask,
                   compute_sharpness=getattr(args, "sharpness_aware_sampling", False),
-                  cache_images_on_cpu=(getattr(args, "resolution_schedule_enabled", False)
-                                       and getattr(args, "resolution_cache_on_cpu", True)),
+                  cache_images_on_cpu=(getattr(args, "cache_images_on_cpu", False)
+                                       or (getattr(args, "resolution_schedule_enabled", False)
+                                           and getattr(args, "resolution_cache_on_cpu", True))),
                   compute_local_sharpness=(getattr(args, "sharpness_aware_sampling", False)
                                            or getattr(args, "densification_edge_aware", False)),
                   compute_edge=getattr(args, "geometry_aware", False) and

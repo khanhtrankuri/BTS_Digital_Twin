@@ -1,0 +1,7 @@
+BASE: absgrad_probe.yaml
+
+# The matched probe improves at 2k, but the stock opacity reset at 3k causes
+# a severe holdout collapse. Freeze topology before that reset and spend the
+# remaining iterations optimizing the compact, well-covered representation.
+DENSIFICATION:
+  UNTIL_ITER: 2500

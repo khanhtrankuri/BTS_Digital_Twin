@@ -1,5 +1,0 @@
-BASE: A0.yaml
-EXPOSURE:
-  ENABLED: true
-  TEST_MODE: pose_confidence_blend
-

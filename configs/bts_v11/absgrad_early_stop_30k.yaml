@@ -1,0 +1,6 @@
+BASE: absgrad_early_stop.yaml
+
+# Continue the compact topology after the strict 7k gate.  No further
+# densification or opacity reset occurs because UNTIL_ITER remains 2500.
+OPTIMIZATION:
+  iterations: 30000

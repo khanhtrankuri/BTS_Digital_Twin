@@ -24,14 +24,19 @@ from utils.sh_utils import RGB2SH
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.training_schedules import get_lr_multipliers
-from utils.exposure_utils import PerViewExposure, frame_time_from_name
+from utils.exposure_utils import PerViewExposure, TemporalExposureSpline, frame_time_from_name
 from utils.sky_utils import DirectionalSHBackground
 from utils.densification_utils import (
     accumulate_visible_statistics,
     limit_mask,
     percentile_mask,
     robust_normalize_score,
+    conservative_opacity_prune_mask,
+    split_opacity_conserving,
 )
+from utils.footprint_sampling import project_gaussian_ellipse, sample_footprint_statistics
+from utils.structure_aligned_split import classify_gaussian_shape, structure_aligned_split
+from utils.spatial_densification import spatially_balanced_topk, tile_error_energy
 from utils.persistent_densification import (
     bitset_popcount,
     compute_persistent_scores,
@@ -51,7 +56,8 @@ _PERSISTENT_BUFFER_NAMES = (
 _INTERVAL_BUFFER_NAMES = (
     "xyz_gradient_abs_accum", "xyz_gradient_sq_accum", "residual_accum",
     "residual_denom", "edge_accum", "visibility_count", "gaussian_age",
-    "importance_accum", "projected_area_accum",
+    "importance_accum", "projected_area_accum", "footprint_residual_accum",
+    "footprint_edge_accum", "footprint_denom",
 )
 
 
@@ -114,12 +120,16 @@ class GaussianModel:
         self.gaussian_age = torch.empty(0, dtype=torch.long)
         self.importance_accum = torch.empty(0)
         self.projected_area_accum = torch.empty(0)
+        self.footprint_residual_accum = torch.empty(0)
+        self.footprint_edge_accum = torch.empty(0)
+        self.footprint_denom = torch.empty(0)
         for name in _PERSISTENT_BUFFER_NAMES:
             setattr(self, name, torch.empty(0))
         self.geometry_aware = False
         self.densification_stats_enabled = False
         self.exposure_enabled = False
         self.exposure_model = None
+        self.exposure_spline = None
         self.exposure_mapping = {}
         self.pretrained_exposures = None
         self.exposure_inference_options = None
@@ -129,6 +139,10 @@ class GaussianModel:
         self._approx_absgrad_warning_printed = False
         self._last_densification_metrics = {}
         self._last_densify_counts = {"cloned": 0, "split": 0, "pruned": 0}
+        self._density_control_metrics = {}
+        self._structure_split_metrics = {}
+        self._last_spatial_context = None
+        self._last_spatial_selection = None
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
@@ -174,6 +188,8 @@ class GaussianModel:
                 "camera_times": self.exposure_model.camera_times.detach(),
                 "optimizer": self.exposure_optimizer.state_dict(),
             }
+            if self.exposure_spline is not None:
+                payload["exposure"]["spline_state"] = self.exposure_spline.state_dict()
         if self.background_model is not None:
             payload["background"] = {
                 "degree": self.background_model.degree,
@@ -268,6 +284,12 @@ class GaussianModel:
     
     @property
     def get_exposure(self):
+        if self.exposure_spline is not None:
+            gain, bias = self.exposure_spline.gains_biases()
+            matrices = gain.new_zeros((gain.shape[0], 3, 4))
+            matrices[:, 0, 0], matrices[:, 1, 1], matrices[:, 2, 2] = gain.unbind(dim=1)
+            matrices[:, :, 3] = bias
+            return matrices
         return self.exposure_model.as_matrices() if self.exposure_model is not None else self.get_xyz.new_empty((0, 3, 4))
 
     def get_exposure_from_name(self, image_name):
@@ -275,7 +297,7 @@ class GaussianModel:
             matrix = self.get_xyz.new_zeros((3, 4))
             matrix[:, :3] = torch.eye(3, device=matrix.device, dtype=matrix.dtype)
             return matrix
-        return self.exposure_model.as_matrices()[self.exposure_mapping[image_name]]
+        return self.get_exposure[self.exposure_mapping[image_name]]
 
     def setup_exposure(self, cam_infos, options=None):
         min_gain = float(getattr(options, "exposure_min_gain", 0.75))
@@ -297,6 +319,14 @@ class GaussianModel:
             valid_focals = focals if all(value > 0 for value in focals) else None
             valid_times = times if all(value is not None for value in times) else None
             self.exposure_model.set_camera_poses(np.stack(positions), np.stack(directions), valid_focals, valid_times)
+        self.exposure_spline = None
+        if bool(getattr(options, "exposure_spline_enabled", False)):
+            self.exposure_spline = TemporalExposureSpline(
+                times, num_knots=int(getattr(options, "exposure_spline_num_knots", 12)),
+                degree=int(getattr(options, "exposure_spline_degree", 3)),
+                min_gain=min_gain, max_gain=max_gain, max_bias=max_bias,
+                per_view_residual=bool(getattr(options, "exposure_per_view_residual_enabled", True)),
+            ).to(device)
 
     def setup_background(self, options=None, initial_color=(0.0, 0.0, 0.0)):
         """Create the optional low-order sky model before optimizer setup."""
@@ -313,8 +343,20 @@ class GaussianModel:
         if self.exposure_model is None:
             return image
         if mode in (None, "training", "learned") and camera.image_name in self.exposure_mapping:
+            if self.exposure_spline is not None:
+                return self.exposure_spline(image, self.exposure_mapping[camera.image_name])
             return self.exposure_model(image, self.exposure_mapping[camera.image_name])
         options = self.exposure_inference_options
+        if self.exposure_spline is not None and mode == "temporal_spline":
+            inferred = self.exposure_spline.infer_time(getattr(camera, "frame_time", None))
+            if inferred is not None:
+                gain, bias = inferred
+                diagnostics = {"mode": "temporal_spline", "confidence": 1.0,
+                               "indices": [], "weights": []}
+                corrected = gain[:, None, None] * image + bias[:, None, None]
+                self.last_exposure_diagnostics = diagnostics
+                return corrected
+            mode = "pose_confidence_blend"
         gain, bias, diagnostics = self.exposure_model.infer_gain_bias(
             camera.camera_center, np.asarray(camera.R, dtype=np.float32)[:, 2], mode or "identity",
             k=int(getattr(options, "exposure_test_k", k)), focal=0.5 * (camera.fx + camera.fy),
@@ -329,6 +371,15 @@ class GaussianModel:
             max_gain_delta=float(getattr(options, "exposure_max_gain_delta_at_test", 0.20)),
             max_bias=float(getattr(options, "exposure_max_bias_at_test", 0.08)),
             return_diagnostics=True)
+        if self.exposure_spline is not None and diagnostics.get("indices"):
+            spline_gains, spline_biases = self.exposure_spline.gains_biases()
+            indices = torch.as_tensor(diagnostics["indices"], device=spline_gains.device, dtype=torch.long)
+            weights = torch.as_tensor(diagnostics["weights"], device=spline_gains.device, dtype=spline_gains.dtype)
+            gain = (weights[:, None] * spline_gains[indices]).sum(dim=0)
+            bias = (weights[:, None] * spline_biases[indices]).sum(dim=0)
+            confidence_value = float(diagnostics.get("confidence", 1.0))
+            gain = 1.0 + confidence_value * (gain - 1.0)
+            bias = confidence_value * bias
         self.last_exposure_diagnostics = diagnostics
         corrected = gain[:, None, None] * image + bias[:, None, None]
         self.last_exposure_diagnostics["out_of_range_fraction"] = float(
@@ -338,6 +389,10 @@ class GaussianModel:
     def exposure_regularization(self, gain_weight, bias_weight, zero_mean_weight=0.0):
         if self.exposure_model is None:
             return self.get_xyz.sum() * 0.0
+        if self.exposure_spline is not None:
+            return self.exposure_spline.regularization_loss(
+                float(getattr(self.training_args, "exposure_spline_smoothness_weight", 0.01)),
+                float(getattr(self.training_args, "exposure_per_view_residual_weight", 0.01)))
         return self.exposure_model.regularization_loss(gain_weight, bias_weight, zero_mean_weight)
 
     def exposure_out_of_range_fraction(self, image):
@@ -364,13 +419,26 @@ class GaussianModel:
                 self.exposure_optimizer.load_state_dict(optimizer_state)
             except (ValueError, KeyError) as error:
                 warnings.warn(f"Exposure optimizer state was incompatible and was reinitialized: {error}")
+        spline_state = payload.get("spline_state")
+        if spline_state is not None and self.exposure_spline is not None:
+            try:
+                self.exposure_spline.load_state_dict(spline_state)
+            except (ValueError, RuntimeError, KeyError) as error:
+                warnings.warn(f"Exposure spline state was incompatible and was reinitialized: {error}")
+        elif spline_state is not None:
+            warnings.warn("Checkpoint contains an exposure spline but the current config disables it.")
 
     def save_exposure_json(self, path):
         if self.exposure_model is None:
             return
-        gains = self.exposure_model.gains().detach().cpu()
-        biases = self.exposure_model.biases().detach().cpu()
-        matrices = self.exposure_model.as_matrices().detach().cpu()
+        if self.exposure_spline is not None:
+            spline_gain, spline_bias = self.exposure_spline.gains_biases()
+            gains, biases = spline_gain.detach().cpu(), spline_bias.detach().cpu()
+            matrices = self.get_exposure.detach().cpu()
+        else:
+            gains = self.exposure_model.gains().detach().cpu()
+            biases = self.exposure_model.biases().detach().cpu()
+            matrices = self.exposure_model.as_matrices().detach().cpu()
         inverse_mapping = {index: name for name, index in self.exposure_mapping.items()}
         views = {}
         for index in range(self.exposure_model.num_views):
@@ -398,6 +466,15 @@ class GaussianModel:
                  "min_gain": self.exposure_model.min_gain, "max_gain": self.exposure_model.max_gain,
                  "max_bias": self.exposure_model.max_bias, "views": views, "inference": inference,
                  "legacy_matrices": {name: views[name]["matrix"] for name in views}}
+        if self.exposure_spline is not None:
+            state["version"] = 5
+            state["mode"] = "temporal_spline"
+            state["spline"] = {
+                "raw_gain_knots": self.exposure_spline.raw_gain_knots.detach().cpu().tolist(),
+                "raw_bias_knots": self.exposure_spline.raw_bias_knots.detach().cpu().tolist(),
+                "raw_gain_residual": self.exposure_spline.raw_gain_residual.detach().cpu().tolist(),
+                "raw_bias_residual": self.exposure_spline.raw_bias_residual.detach().cpu().tolist(),
+            }
         with open(path, "w", encoding="utf-8") as handle:
             json.dump(state, handle, indent=2)
 
@@ -425,6 +502,16 @@ class GaussianModel:
                 gain[index] = torch.diagonal(matrix[:, :3])
                 bias[index] = matrix[:, 3]
         self.exposure_model.load_gain_bias(gain, bias)
+        spline = state.get("spline") if isinstance(state, dict) else None
+        if spline is not None and self.exposure_spline is not None:
+            with torch.no_grad():
+                for name in ("raw_gain_knots", "raw_bias_knots",
+                             "raw_gain_residual", "raw_bias_residual"):
+                    target = getattr(self.exposure_spline, name)
+                    value = torch.as_tensor(spline[name], device=target.device, dtype=target.dtype)
+                    if value.shape != target.shape:
+                        raise ValueError(f"Exposure spline JSON shape mismatch for {name}")
+                    target.copy_(value)
         return True
 
     def save_background(self, path):
@@ -539,6 +626,8 @@ class GaussianModel:
     def training_setup(self, training_args):
         self.training_args = training_args
         self.percent_dense = training_args.percent_dense
+        if getattr(training_args, "initialization_cap_to_max_gaussians", False):
+            self._cap_initial_gaussians(int(training_args.max_gaussians))
         self.geometry_aware = getattr(training_args, "geometry_aware", False)
         self.densification_stats_enabled = (
             self.geometry_aware or getattr(training_args, "densification_method", "original") != "original"
@@ -570,7 +659,9 @@ class GaussianModel:
 
         if self.exposure_model is None:
             raise RuntimeError("Scene must initialize the per-view exposure module before training_setup().")
-        self.exposure_optimizer = torch.optim.Adam(self.exposure_model.parameters(), lr=0.0)
+        exposure_parameters = (self.exposure_spline.parameters()
+                               if self.exposure_spline is not None else self.exposure_model.parameters())
+        self.exposure_optimizer = torch.optim.Adam(exposure_parameters, lr=0.0)
         self.background_optimizer = None
         if self.background_model is not None:
             self.background_optimizer = torch.optim.Adam(
@@ -587,6 +678,24 @@ class GaussianModel:
                                                         lr_delay_mult=training_args.exposure_lr_delay_mult,
                                                         max_steps=training_args.iterations)
 
+    def _cap_initial_gaussians(self, max_points):
+        """Deterministically subsample an oversized initialization before Adam state exists."""
+
+        count = int(self.get_xyz.shape[0])
+        max_points = int(max_points)
+        if max_points <= 0 or count <= max_points:
+            return 0
+        indices = torch.linspace(
+            0, count - 1, steps=max_points, device=self.get_xyz.device).round().long()
+        for name in ("_xyz", "_features_dc", "_features_rest", "_scaling", "_rotation", "_opacity"):
+            value = getattr(self, name).detach()[indices].contiguous()
+            setattr(self, name, nn.Parameter(value.requires_grad_(True)))
+        self.max_radii2D = self.max_radii2D.detach()[indices].contiguous()
+        print(
+            f"BTS-GeoGS initialization cap: {count} -> {max_points} Gaussians",
+            flush=True)
+        return count - max_points
+
     def _reset_geometry_buffers(self):
         """Initialize side statistics without adding optimizer parameters."""
         n, device = self.get_xyz.shape[0], self.get_xyz.device
@@ -600,6 +709,9 @@ class GaussianModel:
             self.gaussian_age = torch.empty(0, device=device, dtype=torch.long)
             self.importance_accum = torch.empty(0, device=device)
             self.projected_area_accum = torch.empty(0, device=device)
+            self.footprint_residual_accum = torch.empty(0, device=device)
+            self.footprint_edge_accum = torch.empty(0, device=device)
+            self.footprint_denom = torch.empty(0, device=device)
             for name in _PERSISTENT_BUFFER_NAMES:
                 dtype = torch.int64 if name in {"window_hit_count", "recent_window_mask",
                                                 "unique_view_support", "view_direction_support",
@@ -615,6 +727,9 @@ class GaussianModel:
         self.gaussian_age = torch.zeros((n, 1), device=device, dtype=torch.long)
         self.importance_accum = torch.zeros((n, 1), device=device)
         self.projected_area_accum = torch.zeros((n, 1), device=device)
+        self.footprint_residual_accum = torch.zeros((n, 1), device=device)
+        self.footprint_edge_accum = torch.zeros((n, 1), device=device)
+        self.footprint_denom = torch.zeros((n, 1), device=device)
         for name in _PERSISTENT_BUFFER_NAMES:
             dtype = torch.int64 if name in {"window_hit_count", "recent_window_mask",
                                             "unique_view_support", "view_direction_support",
@@ -836,7 +951,20 @@ class GaussianModel:
             self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, selected_pts_mask=None):
+    def _record_density_control(self, prefix, parent_raw, child_raw, num_outputs):
+        parent_alpha = torch.sigmoid(parent_raw.detach())
+        child_alpha = torch.sigmoid(child_raw.detach())
+        self._density_control_metrics.update({
+            f"{prefix}_mean_parent_alpha": float(parent_alpha.mean().item()),
+            f"{prefix}_mean_child_alpha": float(child_alpha.mean().item()),
+            f"{prefix}_alpha_mass_before": float(parent_alpha.sum().item()),
+            f"{prefix}_alpha_mass_after": float(child_alpha.sum().item()),
+            f"{prefix}_near_saturation_fraction": float((child_alpha > 0.99).float().mean().item()),
+            f"{prefix}_num_outputs": int(num_outputs),
+        })
+
+    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2, selected_pts_mask=None,
+                          options=None):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -848,25 +976,56 @@ class GaussianModel:
         if not selected_pts_mask.any():
             return 0
 
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
-        samples = torch.normal(mean=means, std=stds)
-        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
-        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
-        new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
+        options = self.training_args if options is None else options
+        parent_xyz = self.get_xyz[selected_pts_mask]
+        parent_scaling = self.get_scaling[selected_pts_mask]
+        parent_rotation = self._rotation[selected_pts_mask]
+        parent_opacity = self._opacity[selected_pts_mask]
+        if getattr(options, "structure_aligned_split_enabled", False):
+            result = structure_aligned_split(
+                parent_xyz, parent_scaling, parent_rotation, parent_opacity,
+                error_direction=None, cfg=options, num_outputs=N)
+            new_xyz = result.xyz
+            new_scaling = self.scaling_inverse_activation(result.scaling)
+            new_rotation = result.rotation
+            new_opacity = result.raw_opacity
+            wire, surface, blob = classify_gaussian_shape(
+                parent_scaling, float(options.wire_ratio_threshold), float(options.surface_ratio_threshold))
+            self._structure_split_metrics = {
+                "wire_like_count": int(wire.sum().item()),
+                "surface_like_count": int(surface.sum().item()),
+                "blob_like_count": int(blob.sum().item()),
+                "wire_split_count": int(wire.sum().item()),
+                "surface_split_count": int(surface.sum().item()),
+                "blob_split_count": int(blob.sum().item()),
+                "child_parent_distance_mean": float(result.parent_distance.mean().item()),
+            }
+        else:
+            stds = parent_scaling.repeat(N, 1)
+            means = torch.zeros((stds.size(0), 3), device=stds.device, dtype=stds.dtype)
+            samples = torch.normal(mean=means, std=stds)
+            rots = build_rotation(parent_rotation).repeat(N, 1, 1)
+            new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + parent_xyz.repeat(N, 1)
+            new_scaling = self.scaling_inverse_activation(parent_scaling.repeat(N, 1) / (0.8 * N))
+            new_rotation = parent_rotation.repeat(N, 1)
+            child_raw = (split_opacity_conserving(parent_opacity, N)
+                         if getattr(options, "opacity_conserving_split", False) else parent_opacity)
+            new_opacity = child_raw.repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
-        new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+
+        self._record_density_control("split", parent_opacity, new_opacity, N)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
 
-        prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        prune_filter = torch.cat((selected_pts_mask, torch.zeros(
+            N * selected_pts_mask.sum(), device=selected_pts_mask.device, dtype=torch.bool)))
         self.prune_points(prune_filter)
         return int(selected_pts_mask.sum().item())
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent, selected_pts_mask=None):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, selected_pts_mask=None,
+                          options=None):
         # Extract points that satisfy the gradient condition
         if selected_pts_mask is None:
             selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
@@ -875,14 +1034,24 @@ class GaussianModel:
         if not selected_pts_mask.any():
             return 0
         
+        options = self.training_args if options is None else options
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
-        new_opacities = self._opacity[selected_pts_mask]
+        parent_opacity = self._opacity[selected_pts_mask].detach().clone()
+        if getattr(options, "opacity_conserving_clone", False):
+            new_opacities = split_opacity_conserving(parent_opacity, 2)
+            with torch.no_grad():
+                self._opacity[selected_pts_mask].copy_(new_opacities)
+        else:
+            new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
+
+        combined_opacity = torch.cat((self._opacity[selected_pts_mask], new_opacities), dim=0)
+        self._record_density_control("clone", parent_opacity, combined_opacity, 2)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
         return int(selected_pts_mask.sum().item())
@@ -892,8 +1061,8 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_clone(grads, max_grad, extent, options=self.training_args)
+        self.densify_and_split(grads, max_grad, extent, options=self.training_args)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
@@ -958,6 +1127,19 @@ class GaussianModel:
         if self.densification_stats_enabled and self.gaussian_age.numel():
             self.gaussian_age.add_(1)
 
+    def accumulate_visibility_only(self, visibility_filter):
+        """Track support for gradient-only density control without image sampling.
+
+        AbsGS and RMS-gradient densification only consume projected gradients.
+        Projecting every Gaussian again and sampling residual/edge maps adds a
+        large O(number-of-Gaussians) Python/Torch pass that those methods do not
+        use.  Keep the shared visibility gate while avoiding that overhead.
+        """
+        if not self.densification_stats_enabled or not self.visibility_count.numel():
+            return
+        visible = visibility_filter.reshape(-1).bool()
+        self.visibility_count[visible] += 1
+
     def accumulate_geometry_stats(self, camera, visibility_filter, residual_map, edge_map, radii,
                                   depth_confidence_map=None):
         """Accumulate per-Gaussian residual/edge statistics from projected centers."""
@@ -993,10 +1175,42 @@ class GaussianModel:
         self.sky_support[visible_2d] += sky[visible_2d]
         self.low_parallax_support[visible_2d] += low_parallax[visible_2d]
         self.depth_consistent_support[visible_2d] += depth_support[visible_2d]
+        if getattr(self.training_args, "footprint_sampling_enabled", False):
+            footprint_mask = visible & (radii >= float(self.training_args.footprint_min_screen_radius))
+            if footprint_mask.any():
+                covariance = self.covariance_activation(
+                    self.get_scaling[footprint_mask].detach(), 1.0,
+                    self._rotation[footprint_mask].detach())
+                centers, axis_major, axis_minor = project_gaussian_ellipse(
+                    self.get_xyz[footprint_mask].detach(), covariance, camera)
+                statistics = sample_footprint_statistics(
+                    residual_map.detach(), edge_map.detach(), centers, axis_major, axis_minor,
+                    pattern=str(self.training_args.footprint_pattern),
+                    mean_weight=float(self.training_args.footprint_mean_weight),
+                    p90_weight=float(self.training_args.footprint_p90_weight),
+                    max_weight=float(self.training_args.footprint_max_weight))
+                selected = torch.nonzero(footprint_mask, as_tuple=False).squeeze(1)
+                valid_samples = statistics["valid_sample_count"] > 0
+                selected = selected[valid_samples]
+                if selected.numel():
+                    self.footprint_residual_accum[selected, 0] += statistics["residual_score"][valid_samples]
+                    self.footprint_edge_accum[selected, 0] += statistics["edge_score"][valid_samples]
+                    self.footprint_denom[selected, 0] += 1
         if getattr(self.training_args, "densification_unique_view_support_enabled", False):
             directions = camera.camera_center[None] - self.get_xyz.detach()
             update_view_support(self.view_direction_support, directions, visible,
                                 int(self.training_args.densification_unique_view_bins))
+        if getattr(self.training_args, "spatial_budget_enabled", False):
+            self._last_spatial_context = {
+                "centers": ndc[:, :2].detach(),
+                "visible": visible.detach(),
+                "tile_energy": tile_error_energy(
+                    residual_map.detach(), edge_map.detach(),
+                    tile_size=int(self.training_args.spatial_tile_size),
+                    edge_weight=float(self.training_args.spatial_tile_edge_weight)),
+                "image_width": int(camera.image_width),
+                "image_height": int(camera.image_height),
+            }
 
     @staticmethod
     def _limit_mask(mask, score, limit):
@@ -1032,6 +1246,11 @@ class GaussianModel:
         residual_denom = self.residual_denom.clamp_min(1.0)
         residual = torch.nan_to_num((self.residual_accum / residual_denom).squeeze(1))
         edge = torch.nan_to_num((self.edge_accum / residual_denom).squeeze(1))
+        footprint_denom = self.footprint_denom.clamp_min(1.0)
+        footprint_residual = torch.nan_to_num(
+            (self.footprint_residual_accum / footprint_denom).squeeze(1))
+        footprint_edge = torch.nan_to_num((self.footprint_edge_accum / footprint_denom).squeeze(1))
+        pixel_coverage = torch.nan_to_num((self.projected_area_accum / residual_denom).squeeze(1))
         valid = (self.denom.squeeze(1) > 0) & torch.isfinite(gradient)
         unique_views = bitset_popcount(
             self.view_direction_support, int(opt.densification_unique_view_bins))
@@ -1048,7 +1267,8 @@ class GaussianModel:
                 original_grad=gradient, abs_grad=absolute_gradient, grad_sq=(self.xyz_gradient_sq_accum / denom).squeeze(1),
                 residual=residual, edge=edge, unique_views=unique_views, depth_support=depth_support,
                 sky_support=sky_support, low_parallax_support=low_parallax_support,
-                valid_mask=valid, cfg=opt)
+                valid_mask=valid, cfg=opt, footprint_residual=footprint_residual,
+                footprint_edge=footprint_edge, pixel_coverage=pixel_coverage)
             score = persistent_scores.total
             if opt.densification_selection_mode == "percentile":
                 window_hit = percentile_mask(score, valid, opt.densification_percentile)
@@ -1102,28 +1322,57 @@ class GaussianModel:
             # Percentile path receives the common eligibility constraints here.
             eligible &= self.visibility_count.squeeze(1) >= int(opt.densification_min_visibility_count)
             eligible &= self.gaussian_age.squeeze(1) >= int(opt.min_gaussian_age)
+        budget = min(max(0, int(opt.max_gaussians) - self.get_xyz.shape[0]),
+                     max(0, int(opt.max_new_gaussians_per_step)))
+        self._last_spatial_selection = None
+        if getattr(opt, "spatial_budget_enabled", False) and self._last_spatial_context is not None and budget > 0:
+            context = self._last_spatial_context
+            if context["centers"].shape[0] == eligible.shape[0]:
+                spatial = spatially_balanced_topk(
+                    eligible & context["visible"], score, context["centers"], context["tile_energy"],
+                    context["image_width"], context["image_height"], budget,
+                    int(opt.spatial_tile_size), float(opt.spatial_tile_budget_gamma),
+                    int(opt.spatial_tile_min_new_gaussians), int(opt.spatial_tile_max_new_gaussians))
+                selected = spatial.selected
+                remaining = max(0, budget - int(selected.sum().item()))
+                if remaining:
+                    selected |= self._limit_mask(eligible & ~selected, score, remaining)
+                eligible = selected
+                self._last_spatial_selection = spatial
         if persistent_mode:
             self.last_densified_iteration[eligible, 0] = int(iteration)
         metric_gradient = gradient
         small = self.get_scaling.max(dim=1).values <= self.percent_dense * extent
         clone_mask, split_mask = eligible & small, eligible & ~small
-        budget = min(max(0, int(opt.max_gaussians) - self.get_xyz.shape[0]),
-                     max(0, int(opt.max_new_gaussians_per_step)))
         clone_mask = self._limit_mask(clone_mask, score, budget)
         budget -= int(clone_mask.sum().item())
         # A split temporarily appends two children before pruning its parent.
         # Reserve both slots so MAX_GAUSSIANS is respected even mid-operation.
         split_mask = self._limit_mask(split_mask, score, budget // 2)
-        cloned = self.densify_and_clone(gradient.unsqueeze(1), max_grad, extent, clone_mask)
+        self._density_control_metrics = {}
+        self._structure_split_metrics = {}
+        cloned = self.densify_and_clone(
+            gradient.unsqueeze(1), max_grad, extent, clone_mask, options=opt)
         if cloned:
             gradient = torch.cat((gradient, torch.zeros(cloned, device=gradient.device)))
             split_mask = torch.cat((split_mask, torch.zeros(cloned, device=split_mask.device, dtype=torch.bool)))
-        split = self.densify_and_split(gradient.unsqueeze(1), max_grad, extent, 2, split_mask)
-        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        split = self.densify_and_split(
+            gradient.unsqueeze(1), max_grad, extent, 2, split_mask, options=opt)
+        if getattr(opt, "densification_opacity_pruning_enabled", True):
+            prune_mask = conservative_opacity_prune_mask(
+                self.get_opacity, self.visibility_count, self.gaussian_age,
+                min_opacity, int(getattr(opt, "min_gaussian_age", 200)))
+        else:
+            # Opacity resets and opacity-conserving splits temporarily produce
+            # many low-alpha children. V5 delegates their removal to scheduled
+            # importance pruning, which has visibility and support evidence.
+            prune_mask = torch.zeros(
+                self.get_xyz.shape[0], dtype=torch.bool, device=self.get_xyz.device)
         thin_protected = self.thin_structure_mask(opt, iteration)
         prune_mask &= ~thin_protected
         if max_screen_size:
-            prune_mask |= (self.max_radii2D > max_screen_size)
+            if getattr(opt, "densification_screen_size_pruning_enabled", True):
+                prune_mask |= (self.max_radii2D > max_screen_size)
             prune_mask |= (self.get_scaling.max(dim=1).values > 0.1 * extent)
         pruned = int(prune_mask.sum().item())
         if pruned and pruned < self.get_xyz.shape[0]:
@@ -1159,6 +1408,21 @@ class GaussianModel:
             "selected_in_sky": int((eligible & (sky_support > 0.5)).sum().item()),
             "selected_in_low_parallax": int((eligible & (low_parallax_support > 0.5)).sum().item()),
             "thin_protected": int(thin_protected.sum().item()),
+            "thin_protection_rate": float(thin_protected.float().mean().item()),
+            "footprint_residual_mean": (float(footprint_residual[valid].mean().item())
+                                        if valid.any() else 0.0),
+            "footprint_edge_mean": (float(footprint_edge[valid].mean().item())
+                                    if valid.any() else 0.0),
+            "footprint_sampled_fraction": float((self.footprint_denom.squeeze(1) > 0).float().mean().item()),
+            "spatial_selected_count": (int(self._last_spatial_selection.selected.sum().item())
+                                       if self._last_spatial_selection is not None else 0),
+            "spatial_budget_total": (int(self._last_spatial_selection.tile_budget.sum().item())
+                                     if self._last_spatial_selection is not None else 0),
+            "spatial_top_decile_budget_fraction": (
+                self._last_spatial_selection.top_decile_budget_fraction
+                if self._last_spatial_selection is not None else 0.0),
+            **self._density_control_metrics,
+            **self._structure_split_metrics,
             **signal_counts,
         }
         self._reset_interval_statistics()
@@ -1167,7 +1431,8 @@ class GaussianModel:
         for name in ("xyz_gradient_accum", "xyz_gradient_abs_accum", "xyz_gradient_sq_accum",
                      "denom", "residual_accum", "residual_denom", "edge_accum",
                      "depth_consistent_support", "sky_support", "low_parallax_support",
-                     "view_direction_support"):
+                     "view_direction_support", "footprint_residual_accum",
+                     "footprint_edge_accum", "footprint_denom"):
             value = getattr(self, name)
             if value.numel():
                 value.zero_()

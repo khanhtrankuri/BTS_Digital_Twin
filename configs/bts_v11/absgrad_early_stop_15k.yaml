@@ -1,0 +1,6 @@
+BASE: absgrad_early_stop.yaml
+
+# Selected by strict HCM0674 position holdout:
+# 15k = 73.1173 versus 30k = 73.1166, so stop at the earlier winner.
+OPTIMIZATION:
+  iterations: 15000

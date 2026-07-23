@@ -4,7 +4,7 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  # Tested on Windows with RTX 4060, NVIDIA driver CUDA 13.1, and PyTorch CUDA 12.8.
+  # Release environment for Windows/RTX 4090 with PyTorch CUDA 12.8.
   # On Windows, install Visual Studio 2022 Build Tools with the C++ workload first.
   - python=3.12
   - pip

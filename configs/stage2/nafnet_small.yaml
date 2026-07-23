@@ -1,8 +1,0 @@
-_BASE_: nafnet_base.yaml
-MODEL:
-  WIDTH: 32
-  ENCODER_BLOCKS: [1, 1, 2, 2]
-  MIDDLE_BLOCKS: 4
-  DECODER_BLOCKS: [1, 1, 1, 1]
-DATA:
-  BATCH_SIZE: 12

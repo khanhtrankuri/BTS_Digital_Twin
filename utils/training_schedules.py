@@ -83,3 +83,26 @@ def get_lr_multipliers(iteration, cfg):
         prefix = "lr_stage_c"
     return {key: float(getattr(cfg, f"{prefix}_{key}")) for key in
             ("xyz", "scaling", "rotation", "features", "opacity", "exposure")}
+
+
+def piecewise_peak_weight(iteration: int, start_iter: int, peak_iter: int, end_iter: int,
+                          initial: float, peak: float, final: float) -> float:
+    """Piecewise-linear start/peak/end schedule with zero outside its range."""
+
+    if not (0 <= start_iter <= peak_iter <= end_iter):
+        raise ValueError("schedule must satisfy 0 <= start_iter <= peak_iter <= end_iter")
+    if iteration < start_iter or iteration > end_iter:
+        return 0.0
+    if iteration == start_iter:
+        return float(initial)
+    if iteration == peak_iter:
+        return float(peak)
+    if iteration == end_iter:
+        return float(final)
+    if iteration <= peak_iter:
+        span = max(1, peak_iter - start_iter)
+        ratio = (iteration - start_iter) / float(span)
+        return float(initial) + ratio * (float(peak) - float(initial))
+    span = max(1, end_iter - peak_iter)
+    ratio = (iteration - peak_iter) / float(span)
+    return float(peak) + ratio * (float(final) - float(peak))

@@ -1,5 +1,0 @@
-_BASE_: nafnet_multiview.yaml
-MODEL:
-  GEOMETRY_MODE: full
-LOSS:
-  EDGE_WEIGHT: 0.05

@@ -80,7 +80,7 @@ def build_rotation(r):
 
     q = r / norm[:, None]
 
-    R = torch.zeros((q.size(0), 3, 3), device='cuda')
+    R = torch.zeros((q.size(0), 3, 3), device=q.device, dtype=q.dtype)
 
     r = q[:, 0]
     x = q[:, 1]

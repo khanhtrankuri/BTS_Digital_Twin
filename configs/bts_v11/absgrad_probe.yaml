@@ -1,0 +1,49 @@
+# BTS v11 strict Stage-1 probe: true AbsGS densification.
+# Based on the official AbsGS idea: accumulate absolute per-pixel projected
+# mean gradients so opposing pixel gradients cannot cancel before splitting.
+OPTIMIZATION:
+  iterations: 7000
+  geometry_aware: false
+  loss_schedule_enabled: false
+  exposure_compensation: false
+
+DATA:
+  RESOLUTION: 2
+
+DENSIFICATION:
+  METHOD: absolute_gradient
+  FROM_ITER: 500
+  UNTIL_ITER: 7000
+  INTERVAL: 100
+  ABS_GRAD_THRESHOLD: 0.0008
+  SELECTION_MODE: threshold
+  MIN_VISIBILITY_COUNT: 1
+  MIN_GAUSSIAN_AGE: 0
+  MAX_GAUSSIANS: 2500000
+  MAX_NEW_GAUSSIANS_PER_STEP: 100000
+  OPACITY_PRUNING_ENABLED: true
+  SCREEN_SIZE_PRUNING_ENABLED: true
+  OPACITY_CONSERVING_CLONE: false
+  OPACITY_CONSERVING_SPLIT: false
+  STRUCTURE_ALIGNED_SPLIT: false
+
+EXPOSURE:
+  ENABLED: false
+
+MULTIVIEW_DEPTH:
+  ENABLED: false
+
+MULTIVIEW_RGB:
+  ENABLED: false
+
+POSE_REFINEMENT:
+  ENABLED: false
+
+BLUR_FORMATION:
+  ENABLED: false
+
+PATCH_REFINEMENT:
+  ENABLED: false
+
+PIPELINE:
+  antialiasing: true

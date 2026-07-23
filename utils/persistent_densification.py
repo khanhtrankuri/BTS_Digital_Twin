@@ -77,7 +77,9 @@ def compute_persistent_scores(*, original_grad: torch.Tensor, abs_grad: torch.Te
                               edge: torch.Tensor, unique_views: torch.Tensor,
                               depth_support: torch.Tensor, sky_support: torch.Tensor,
                               low_parallax_support: torch.Tensor, valid_mask: torch.Tensor,
-                              cfg) -> PersistentScores:
+                              cfg, footprint_residual: torch.Tensor | None = None,
+                              footprint_edge: torch.Tensor | None = None,
+                              pixel_coverage: torch.Tensor | None = None) -> PersistentScores:
     """Compute robust, fully configurable persistent densification scores."""
 
     burst = gradient_burstiness(abs_grad, grad_sq)
@@ -89,11 +91,30 @@ def compute_persistent_scores(*, original_grad: torch.Tensor, abs_grad: torch.Te
         "multiview": robust_normalize_score(unique_views.float(), valid_mask),
         "depth": robust_normalize_score(depth_support, valid_mask),
     }
+    signals["footprint_residual"] = (robust_normalize_score(footprint_residual, valid_mask)
+                                     if footprint_residual is not None else torch.zeros_like(residual))
+    signals["footprint_edge"] = (robust_normalize_score(footprint_edge, valid_mask)
+                                 if footprint_edge is not None else torch.zeros_like(edge))
+    signals["coverage"] = (robust_normalize_score(pixel_coverage, valid_mask)
+                           if pixel_coverage is not None else torch.zeros_like(edge))
+    if getattr(cfg, "footprint_sampling_enabled", False):
+        residual_signal = (
+            float(getattr(cfg, "center_residual_weight", 0.05)) * signals["residual"]
+            + float(getattr(cfg, "footprint_residual_weight", 0.25)) * signals["footprint_residual"]
+        )
+        footprint_term = (
+            float(getattr(cfg, "footprint_edge_weight", 0.10)) * signals["footprint_edge"]
+            + float(getattr(cfg, "pixel_coverage_weight", 0.0)) * signals["coverage"]
+        )
+    else:
+        residual_signal = float(cfg.densification_residual_weight) * signals["residual"]
+        footprint_term = torch.zeros_like(residual_signal)
     total = (
         float(cfg.densification_original_grad_weight) * signals["original"]
         + float(cfg.densification_abs_grad_weight) * signals["absolute"]
-        + float(cfg.densification_residual_weight) * signals["residual"]
+        + residual_signal
         + float(cfg.densification_edge_weight) * signals["edge"]
+        + footprint_term
         + float(cfg.densification_multiview_weight) * signals["multiview"]
         + float(cfg.densification_depth_support_weight) * signals["depth"]
     )
@@ -105,8 +126,9 @@ def compute_persistent_scores(*, original_grad: torch.Tensor, abs_grad: torch.Te
     total = total * torch.where(
         low_parallax_support > 0.5,
         total.new_tensor(float(cfg.densification_low_parallax_score_multiplier)), 1.0)
-    return PersistentScores(total, signals["original"], signals["absolute"], signals["residual"],
-                            signals["edge"], signals["multiview"], signals["depth"], burst)
+    return PersistentScores(total, signals["original"], signals["absolute"], residual_signal,
+                            signals["edge"] + signals["footprint_edge"],
+                            signals["multiview"], signals["depth"], burst)
 
 
 def update_persistent_window(score_ema: torch.Tensor, hit_ema: torch.Tensor,

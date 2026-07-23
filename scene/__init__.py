@@ -40,6 +40,24 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
+        if getattr(args, "camera_use_undistorted_data", False) and getattr(
+                args, "camera_require_undistortion_metadata", False):
+            metadata_path = os.path.join(args.source_path, "undistortion_metadata.json")
+            if not os.path.isfile(metadata_path):
+                raise FileNotFoundError(
+                    "CAMERA.REQUIRE_UNDISTORTION_METADATA is enabled, but the prepared-scene "
+                    f"marker is missing: {metadata_path}. Train from the output of "
+                    "tools/prepare_undistorted_scene.py, not the raw HCM directory.")
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                undistortion_metadata = json.load(handle)
+            recorded_output = os.path.normcase(os.path.realpath(undistortion_metadata.get("output", "")))
+            current_source = os.path.normcase(os.path.realpath(args.source_path))
+            if recorded_output != current_source or int(undistortion_metadata.get("images_processed", 0)) <= 0:
+                raise ValueError(
+                    "Undistortion metadata does not describe the current non-empty scene output; "
+                    "refusing to mix raw images with pinhole intrinsics.")
+            print(f"[BTS-GeoGS] Verified prepared undistorted scene: {metadata_path}")
+
         # Camera construction needs these optimization switches to decide
         # whether edge/geometry priors should be materialized.
         if optimization_args is not None:

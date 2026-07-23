@@ -1,7 +1,0 @@
-OPTIMIZATION:
-  geometry_aware: true
-  densification_method: hybrid
-  exposure_compensation: true
-  loss_schedule_enabled: true
-PIPELINE:
-  antialiasing: true

@@ -1,3 +1,0 @@
-BASE: A0.yaml
-CAMERA: {USE_UNDISTORTED_DATA: true}
-

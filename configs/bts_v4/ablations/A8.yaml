@@ -1,6 +1,0 @@
-BASE: A0.yaml
-SKY:
-  ENABLED: true
-  BACKGROUND_MODE: directional_sh
-LOW_PARALLAX: {ENABLED: true}
-

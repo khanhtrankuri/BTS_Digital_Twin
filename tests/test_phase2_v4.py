@@ -56,12 +56,15 @@ def test_identity_camera_depth_reprojection_is_consistent():
     assert result.relative_error.max() < 1e-5
 
 
-def test_scene_config_inherits_v4_base():
-    config = load_bts_geogs_config("configs/bts_v4/HCM0644.yaml")
-    assert config["resolution"] == 1
-    assert config["densification_method"] == "persistent_multiview_hybrid"
-    assert config["camera_use_undistorted_data"] is True
-    assert config["sharpness_aware_sampling"] is True
+def test_release_config_resolves_absgrad_inheritance():
+    config = load_bts_geogs_config(
+        "configs/bts_v11/absgrad_early_stop_15k.yaml"
+    )
+    assert config["resolution"] == 2
+    assert config["iterations"] == 15000
+    assert config["densification_method"] == "absolute_gradient"
+    assert config["densify_until_iter"] == 2500
+    assert config["antialiasing"] is True
 
 
 def test_directional_background_has_bounded_image_output():
