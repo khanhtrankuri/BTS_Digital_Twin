@@ -8,6 +8,13 @@ tối ưu geometry/SH đến iteration 15.000.
 Repository chỉ chứa source code, CUDA extension, cấu hình và test. Dataset,
 checkpoint, ảnh render và ZIP submission không được đưa lên Git.
 
+> **Nhánh nghiên cứu v12:** leaderboard v11 đạt `65.0192`
+> (`PSNR 22.665939`, `SSIM 0.743145`, `LPIPS 0.271867`). Pipeline v12 sửa
+> mismatch half-resolution/full-resolution, thêm native-crop LPIPS,
+> multi-scale SSIM và validation temporal-matched trên bảy scene. Đây là
+> candidate cần ablation, chưa phải điểm leaderboard đã xác nhận. Xem
+> [thiết kế và lệnh chạy v12](docs/BTS_V12_RND.md).
+
 ## Kết quả lựa chọn model
 
 Kết quả dưới đây được đo trên position-extrapolation holdout HCM0674; RGB của
@@ -272,6 +279,25 @@ và ý tưởng absolute-gradient densification của AbsGS:
 
 - 3D Gaussian Splatting: <https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/>
 - AbsGS: <https://ty424.github.io/AbsGS.github.io/>
+
+## Optional Stage 2: BTS GeoNAF-GS
+
+The repository also includes the opt-in two-stage pipeline:
+
+```text
+AbsGS v11 -> RGB + geometry maps -> residual confidence-masked NAFNet
+```
+
+Stage 2 is disabled by default (`STAGE2.ENABLED: false`) and does not alter
+`train.py`, `render.py`, old checkpoints, or raw baseline output. The refiner
+can only add a confidence-masked RGB residual bounded by `RESIDUAL_SCALE`.
+Ground truth is used only as a training/evaluation target and is never an
+inference input.
+
+The default config is `configs/stage2/geonaf_base.yaml`. See
+[the complete BTS GeoNAF-GS guide](docs/BTS_GEONAF_GS.md) for export, train,
+render, evaluation, optional joint fine-tuning, loss definitions, and
+recommended ablations.
 
 Xem `LICENSE.md` và license trong từng thư mục CUDA extension trước khi phân
 phối lại.

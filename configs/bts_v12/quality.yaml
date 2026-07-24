@@ -1,0 +1,67 @@
+BASE: fullres.yaml
+
+# A2 / default v12 candidate: preserve the validated v11 AbsGS topology phase,
+# then spend the remaining budget on metric-aligned native-resolution
+# appearance refinement.
+OPTIMIZATION:
+  loss_schedule_enabled: true
+  loss_stage_a_end: 2500
+  loss_stage_b_end: 8000
+  loss_stage_c_end: 20000
+
+  # Geometry/topology phase.
+  loss_stage_a_l1: 0.75
+  loss_stage_a_mse: 0.00
+  loss_stage_a_dssim: 0.25
+  loss_stage_a_geometry: 1.00
+  loss_stage_a_edge: 1.00
+  loss_stage_a_exposure: 1.00
+  lr_stage_a_xyz: 1.00
+  lr_stage_a_scaling: 1.00
+  lr_stage_a_rotation: 1.00
+  lr_stage_a_features: 1.00
+  lr_stage_a_opacity: 1.00
+  lr_stage_a_exposure: 1.00
+
+  # Resolution transition and joint refinement.
+  loss_stage_b_l1: 0.55
+  loss_stage_b_mse: 0.10
+  loss_stage_b_dssim: 0.35
+  loss_stage_b_geometry: 1.00
+  loss_stage_b_edge: 1.00
+  loss_stage_b_exposure: 1.00
+  lr_stage_b_xyz: 0.50
+  lr_stage_b_scaling: 0.50
+  lr_stage_b_rotation: 0.50
+  lr_stage_b_features: 1.00
+  lr_stage_b_opacity: 0.50
+  lr_stage_b_exposure: 0.50
+
+  # Late appearance phase: stabilize geometry and target SSIM/LPIPS.
+  loss_stage_c_l1: 0.45
+  loss_stage_c_mse: 0.10
+  loss_stage_c_dssim: 0.45
+  loss_stage_c_geometry: 0.20
+  loss_stage_c_edge: 1.00
+  loss_stage_c_exposure: 0.20
+  lr_stage_c_xyz: 0.10
+  lr_stage_c_scaling: 0.10
+  lr_stage_c_rotation: 0.10
+  lr_stage_c_features: 0.75
+  lr_stage_c_opacity: 0.20
+  lr_stage_c_exposure: 0.10
+
+STRUCTURAL:
+  MULTISCALE_SSIM_ENABLED: true
+  COARSE_WEIGHT: 0.25
+  DOWNSAMPLE_FACTOR: 2
+
+PERCEPTUAL:
+  ENABLED: true
+  START_ITER: 8000
+  END_ITER: 20000
+  INTERVAL: 4
+  WEIGHT: 0.05
+  MODE: native_crops
+  CROP_SIZE: 256
+  NUM_CROPS: 2

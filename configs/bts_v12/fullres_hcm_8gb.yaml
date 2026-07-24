@@ -1,0 +1,6 @@
+BASE: fullres_8gb.yaml
+
+# Scene-specific memory bound measured on the five 1320x989 HCM scenes.
+DENSIFICATION:
+  MAX_GAUSSIANS: 350000
+  MAX_NEW_GAUSSIANS_PER_STEP: 15000

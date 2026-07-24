@@ -1,0 +1,7 @@
+BASE: control_v11.yaml
+
+# Native-resolution validation of the v11 optimization path with the same
+# bounded topology budget used by the 8 GB v12 candidates.
+DENSIFICATION:
+  MAX_GAUSSIANS: 450000
+  MAX_NEW_GAUSSIANS_PER_STEP: 20000

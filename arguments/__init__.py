@@ -186,6 +186,12 @@ def load_bts_geogs_config(path):
         ("PERCEPTUAL", "INTERVAL"): "perceptual_loss_interval",
         ("PERCEPTUAL", "WEIGHT"): "perceptual_loss_weight",
         ("PERCEPTUAL", "MAX_SIZE"): "perceptual_loss_max_size",
+        ("PERCEPTUAL", "MODE"): "perceptual_loss_mode",
+        ("PERCEPTUAL", "CROP_SIZE"): "perceptual_loss_crop_size",
+        ("PERCEPTUAL", "NUM_CROPS"): "perceptual_loss_num_crops",
+        ("STRUCTURAL", "MULTISCALE_SSIM_ENABLED"): "multiscale_ssim_enabled",
+        ("STRUCTURAL", "COARSE_WEIGHT"): "multiscale_ssim_coarse_weight",
+        ("STRUCTURAL", "DOWNSAMPLE_FACTOR"): "multiscale_ssim_downsample_factor",
         ("MULTIVIEW_DEPTH", "ENABLED"): "multiview_depth_enabled",
         ("MULTIVIEW_DEPTH", "WEIGHT"): "multiview_depth_weight",
         ("MULTIVIEW_DEPTH", "INTERVAL"): "multiview_depth_interval",
@@ -260,6 +266,7 @@ def load_bts_geogs_config(path):
         ("PATCH_REFINEMENT", "MIN_PATCH_DISTANCE"): "patch_refinement_min_patch_distance",
         ("VALIDATION", "SPLIT_FILE"): "validation_split_file",
         ("VALIDATION", "STRICT_SPARSE_PATH"): "strict_sparse_path",
+        ("VALIDATION", "FULL_RESOLUTION"): "validation_full_resolution",
     }
     defaults = dict(config.get("OPTIMIZATION", {}))
     defaults.update(config.get("PIPELINE", {}))
@@ -327,6 +334,10 @@ class ModelParams(ParamGroup):
         self.camera_require_undistortion_metadata = False
         self.validation_split_file = ""
         self.strict_sparse_path = ""
+        # Load a dedicated native-resolution validation camera set even when
+        # training at a lower resolution. This keeps model selection aligned
+        # with full-resolution submission metrics.
+        self.validation_full_resolution = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -461,6 +472,12 @@ class OptimizationParams(ParamGroup):
         self.perceptual_loss_interval = 1
         self.perceptual_loss_weight = 0.05
         self.perceptual_loss_max_size = 256
+        self.perceptual_loss_mode = "resize"
+        self.perceptual_loss_crop_size = 256
+        self.perceptual_loss_num_crops = 1
+        self.multiscale_ssim_enabled = False
+        self.multiscale_ssim_coarse_weight = 0.25
+        self.multiscale_ssim_downsample_factor = 2
         self.lr_stage_a_xyz, self.lr_stage_a_scaling, self.lr_stage_a_rotation = 1.0, 1.0, 1.0
         self.lr_stage_a_features, self.lr_stage_a_opacity, self.lr_stage_a_exposure = 1.0, 1.0, 1.0
         self.lr_stage_b_xyz, self.lr_stage_b_scaling, self.lr_stage_b_rotation = 0.5, 0.5, 0.5

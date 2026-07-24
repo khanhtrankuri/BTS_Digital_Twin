@@ -1,0 +1,15 @@
+BASE: geonaf_base.yaml
+
+# One shared refiner is trained on GPU 0 after both T4s finish their parallel
+# Stage-1 scene queues. Batch size 2 leaves headroom on a 16 GB T4.
+DATA:
+  PATCH_SIZE: 256
+  NUM_WORKERS: 4
+
+TRAIN:
+  BATCH_SIZE: 2
+  AMP: true
+
+INFERENCE:
+  TILE_SIZE: 512
+  TILE_OVERLAP: 64

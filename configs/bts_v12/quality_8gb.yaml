@@ -1,0 +1,19 @@
+BASE: quality.yaml
+
+# Same hypothesis as quality.yaml with a bounded topology and cheaper late
+# LPIPS pass for 8 GB cards.
+DENSIFICATION:
+  MAX_GAUSSIANS: 450000
+  MAX_NEW_GAUSSIANS_PER_STEP: 20000
+
+RESOLUTION_SCHEDULE:
+  STAGES:
+    - {START_ITER: 0, SCALE: 0.50}
+    - {START_ITER: 4000, SCALE: 0.75}
+    - {START_ITER: 12000, SCALE: 1.00}
+
+PERCEPTUAL:
+  START_ITER: 12000
+  INTERVAL: 6
+  CROP_SIZE: 192
+  NUM_CROPS: 1

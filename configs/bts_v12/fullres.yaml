@@ -1,0 +1,19 @@
+BASE: ../bts_v11/absgrad_early_stop_15k.yaml
+
+# A1: isolate the impact of matching train and submission resolution.
+OPTIMIZATION:
+  iterations: 20000
+
+DATA:
+  RESOLUTION: 1
+
+RESOLUTION_SCHEDULE:
+  ENABLED: true
+  CACHE_ON_CPU: true
+  STAGES:
+    - {START_ITER: 0, SCALE: 0.50}
+    - {START_ITER: 2500, SCALE: 0.75}
+    - {START_ITER: 6000, SCALE: 1.00}
+
+VALIDATION:
+  FULL_RESOLUTION: true

@@ -1,0 +1,6 @@
+BASE: ../bts_v11/absgrad_early_stop_15k.yaml
+
+# Exact v11 optimization path. The only change is that validation is loaded at
+# native output resolution, making its score comparable to the leaderboard.
+VALIDATION:
+  FULL_RESOLUTION: true
