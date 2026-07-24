@@ -1,0 +1,20 @@
+BASE: quality.yaml
+
+# A3 research branch. Keep only if it beats quality.yaml on at least two HCM
+# scenes and does not regress the aggregate native-resolution score.
+MULTIVIEW_RGB:
+  ENABLED: true
+  START_ITER: 8000
+  PEAK_ITER: 14000
+  END_ITER: 20000
+  INTERVAL: 10
+  WEIGHT_INITIAL: 0.000
+  WEIGHT_PEAK: 0.015
+  WEIGHT_FINAL: 0.005
+  NUM_SOURCE_VIEWS: 1
+  LOSS_MODE: zncc_gradient
+  ZNCC_WEIGHT: 1.00
+  GRADIENT_WEIGHT: 0.20
+  CHARBONNIER_WEIGHT: 0.10
+  MIN_OVERLAP: 0.20
+  TEMPORAL_BRACKETING: false

@@ -1,0 +1,14 @@
+BASE: geonaf_base.yaml
+
+# Conservative Phase-2 profile for a local RTX 4060 8 GB.
+DATA:
+  PATCH_SIZE: 256
+  NUM_WORKERS: 2
+
+TRAIN:
+  BATCH_SIZE: 1
+  AMP: true
+
+INFERENCE:
+  TILE_SIZE: 384
+  TILE_OVERLAP: 64

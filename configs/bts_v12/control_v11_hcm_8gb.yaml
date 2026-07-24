@@ -1,0 +1,7 @@
+BASE: control_v11_8gb.yaml
+
+# HCM sparse reconstructions densify much more aggressively than bonsai/chair.
+# This measured cap leaves room for native-resolution raster buffers on 8 GB.
+DENSIFICATION:
+  MAX_GAUSSIANS: 350000
+  MAX_NEW_GAUSSIANS_PER_STEP: 15000

@@ -35,6 +35,7 @@ from utils.densification_utils import corrected_residual_map
 from utils.multiview_rgb import multiview_rgb_loss, warp_source_rgb_to_target
 from utils.source_view_selection import select_source_views
 from utils.patch_refinement import sample_patch
+from utils.perceptual_utils import native_resolution_crops
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -133,6 +134,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     perceptual_model = None
     if opt.perceptual_loss_enabled:
+        if opt.perceptual_loss_mode not in {"resize", "native_crops"}:
+            raise ValueError(
+                "PERCEPTUAL.MODE must be either 'resize' or 'native_crops', "
+                f"got {opt.perceptual_loss_mode!r}")
         perceptual_model = get_lpips_model()
         if perceptual_model is None:
             raise RuntimeError(
@@ -325,32 +330,73 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             reconstruction_map = difference.abs().mean(dim=0, keepdim=True)
         reconstruction_loss = (loss_photometric * reconstruction_map).sum() / loss_photometric.sum().clamp_min(1e-6)
         if FUSED_SSIM_AVAILABLE:
-            ssim_value = fused_ssim(loss_image.unsqueeze(0), loss_gt.unsqueeze(0))
+            native_ssim_value = fused_ssim(
+                loss_image.unsqueeze(0), loss_gt.unsqueeze(0))
         else:
-            ssim_value = ssim(loss_image, loss_gt)
+            native_ssim_value = ssim(loss_image, loss_gt)
+        ssim_value = native_ssim_value
+        coarse_ssim_value = None
+        if opt.multiscale_ssim_enabled:
+            factor = int(opt.multiscale_ssim_downsample_factor)
+            coarse_weight = float(opt.multiscale_ssim_coarse_weight)
+            if factor < 2:
+                raise ValueError(
+                    "STRUCTURAL.DOWNSAMPLE_FACTOR must be at least 2")
+            if not 0.0 <= coarse_weight <= 1.0:
+                raise ValueError(
+                    "STRUCTURAL.COARSE_WEIGHT must be between 0 and 1")
+            if min(loss_image.shape[-2:]) >= factor:
+                coarse_image = torch.nn.functional.avg_pool2d(
+                    loss_image.unsqueeze(0), factor, stride=factor)
+                coarse_gt = torch.nn.functional.avg_pool2d(
+                    loss_gt.unsqueeze(0), factor, stride=factor)
+                if FUSED_SSIM_AVAILABLE:
+                    coarse_ssim_value = fused_ssim(coarse_image, coarse_gt)
+                else:
+                    coarse_ssim_value = ssim(coarse_image[0], coarse_gt[0])
+                ssim_value = (
+                    (1.0 - coarse_weight) * native_ssim_value
+                    + coarse_weight * coarse_ssim_value
+                )
 
         stage_weights = get_stage_loss_weights(iteration, opt)
         mse_value = torch.nn.functional.mse_loss(loss_image, loss_gt)
         loss = stage_weights["l1"] * reconstruction_loss + stage_weights["mse"] * mse_value + stage_weights["dssim"] * (1.0 - ssim_value)
-        loss_terms = {"rgb": Ll1, "l1": Ll1, "mse": mse_value, "dssim": 1.0 - ssim_value}
+        loss_terms = {
+            "rgb": Ll1,
+            "l1": Ll1,
+            "mse": mse_value,
+            "dssim": 1.0 - ssim_value,
+            "ssim_native": native_ssim_value,
+        }
+        if coarse_ssim_value is not None:
+            loss_terms["ssim_coarse"] = coarse_ssim_value
         perceptual_active = (
             perceptual_model is not None
             and int(opt.perceptual_loss_start_iter) <= iteration <= int(opt.perceptual_loss_end_iter)
             and iteration % max(1, int(opt.perceptual_loss_interval)) == 0)
         if perceptual_active:
-            perceptual_image = image.unsqueeze(0)
-            perceptual_gt = gt_image.unsqueeze(0)
-            max_size = max(32, int(opt.perceptual_loss_max_size))
-            height, width = perceptual_image.shape[-2:]
-            if max(height, width) > max_size:
-                scale = max_size / float(max(height, width))
-                target_size = (
-                    max(32, round(height * scale)),
-                    max(32, round(width * scale)))
-                perceptual_image = torch.nn.functional.interpolate(
-                    perceptual_image, size=target_size, mode="bilinear", align_corners=False)
-                perceptual_gt = torch.nn.functional.interpolate(
-                    perceptual_gt, size=target_size, mode="bilinear", align_corners=False)
+            if opt.perceptual_loss_mode == "native_crops":
+                perceptual_image, perceptual_gt = native_resolution_crops(
+                    image,
+                    gt_image,
+                    int(opt.perceptual_loss_crop_size),
+                    int(opt.perceptual_loss_num_crops),
+                )
+            else:
+                perceptual_image = image.unsqueeze(0)
+                perceptual_gt = gt_image.unsqueeze(0)
+                max_size = max(32, int(opt.perceptual_loss_max_size))
+                height, width = perceptual_image.shape[-2:]
+                if max(height, width) > max_size:
+                    scale = max_size / float(max(height, width))
+                    target_size = (
+                        max(32, round(height * scale)),
+                        max(32, round(width * scale)))
+                    perceptual_image = torch.nn.functional.interpolate(
+                        perceptual_image, size=target_size, mode="bilinear", align_corners=False)
+                    perceptual_gt = torch.nn.functional.interpolate(
+                        perceptual_gt, size=target_size, mode="bilinear", align_corners=False)
             perceptual_loss = perceptual_model(
                 perceptual_image * 2.0 - 1.0,
                 perceptual_gt * 2.0 - 1.0).mean()
@@ -816,7 +862,7 @@ def training_report(tb_writer, iteration, Ll1, loss, elapsed, testing_iterations
             "gaussian_count": int(scene.gaussians.get_xyz.shape[0]),
             "splits": {},
         }
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
+        validation_configs = ({'name': 'test', 'cameras' : scene.getValidationCameras()},
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
@@ -871,6 +917,8 @@ def training_report(tb_writer, iteration, Ll1, loss, elapsed, testing_iterations
                     split_record["per_view"].append({
                         "image_name": viewpoint.image_name,
                         "difficulty": difficulty or None,
+                        "width": int(viewpoint.image_width),
+                        "height": int(viewpoint.image_height),
                         **metrics_to_floats(view_metrics),
                     })
                     if difficulty:

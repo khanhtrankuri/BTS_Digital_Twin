@@ -12,6 +12,7 @@
 import os
 import random
 import json
+from copy import copy
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
@@ -115,6 +116,23 @@ class Scene:
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
 
+        self.validation_cameras = None
+        if (getattr(args, "validation_full_resolution", False)
+                and int(getattr(args, "resolution", 1)) != 1
+                and scene_info.test_cameras):
+            validation_args = copy(args)
+            validation_args.resolution = 1
+            validation_args.resolution_schedule_enabled = True
+            validation_args.resolution_cache_on_cpu = True
+            print("Loading Native-Resolution Validation Cameras")
+            self.validation_cameras = cameraList_from_camInfos(
+                scene_info.test_cameras,
+                1.0,
+                validation_args,
+                scene_info.is_nerf_synthetic,
+                True,
+            )
+
         # One exposure implementation is shared by training, checkpointing and
         # inference. CameraInfo order matches the exposure mapping and Camera uid.
         self.gaussians.setup_exposure(scene_info.train_cameras, optimization_args)
@@ -157,3 +175,8 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
+
+    def getValidationCameras(self):
+        if self.validation_cameras is not None:
+            return self.validation_cameras
+        return self.getTestCameras()
