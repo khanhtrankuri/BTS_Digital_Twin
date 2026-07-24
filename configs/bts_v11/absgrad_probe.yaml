@@ -11,7 +11,7 @@ DATA:
   RESOLUTION: 2
 
 DENSIFICATION:
-  METHOD: absolute_gradient
+  METHOD: absolute_gradient_approx
   FROM_ITER: 500
   UNTIL_ITER: 7000
   INTERVAL: 100
@@ -28,22 +28,22 @@ DENSIFICATION:
   STRUCTURE_ALIGNED_SPLIT: false
 
 EXPOSURE:
-  ENABLED: false
+  ENABLED: True
 
 MULTIVIEW_DEPTH:
-  ENABLED: false
+  ENABLED: True
 
 MULTIVIEW_RGB:
-  ENABLED: false
+  ENABLED: True
 
 POSE_REFINEMENT:
-  ENABLED: false
+  ENABLED: True
 
 BLUR_FORMATION:
-  ENABLED: false
+  ENABLED: True
 
 PATCH_REFINEMENT:
-  ENABLED: false
+  ENABLED: True
 
 PIPELINE:
   antialiasing: true
